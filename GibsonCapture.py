@@ -15,7 +15,7 @@ import dearpygui.dearpygui as dpg
 # CONFIGURATION (most of it editable in the GUI at runtime)
 # ==========================================
 SAVE_ROOT = r"C:\Gibson"
-JETSON_URL = "http://100.103.105.68:8000"          # Tailscale address, see ACCESS.md
+JETSON_URL = "https://drstreet.taildab2f8.ts.net"  # Funnel: public, no client install
 API_KEY = os.environ.get("GIBSON_API_KEY", "")     # avoids retyping it every launch
 ZOOM = 1.13              # calibration knob: lens/sensor crop, tune per rig
 GAMMA = 1.0              # calibration knob: display only, 1.0 = raw passthrough
@@ -68,10 +68,14 @@ def _base(u):
 
 
 def _tailnet(url):
-    """A 100.64.0.0/10 address or a MagicDNS name - both need Tailscale on THIS pc.
-    A .ts.net name resolves publicly but still points at the CGNAT address, so it
-    is not a way around installing Tailscale; only Funnel would be."""
-    return ".ts.net" in url or any(f"//100.{n}." in url for n in range(64, 128))
+    """True only for a literal 100.64.0.0/10 address, which is reachable solely
+    from a machine running Tailscale.
+
+    A .ts.net name is NOT in this set: with Funnel enabled it resolves through
+    Tailscale's public ingress and works from anywhere with nothing installed.
+    (On a machine that does run Tailscale, MagicDNS answers the same name with
+    the CGNAT address instead - so never infer the path from a local lookup.)"""
+    return any(f"//100.{n}." in url for n in range(64, 128))
 
 
 def _hint(err, url=""):
@@ -80,11 +84,11 @@ def _hint(err, url=""):
     if "timed out" in e or "timeout" in e:
         # The gateway publishes 8000 on the host, so a capture PC on the same
         # network as the Jetson reaches it directly, no Tailscale involved.
-        return ("NO ROUTE to a tailnet address - Tailscale must be running on THIS pc "
-                "(tray icon: Connected). No Tailscale here? Use the Jetson's LAN IP "
-                "instead, http://192.168.x.x:8000" if _tailnet(url) else
-                "NO ROUTE - nothing answered. Check the address and that the PC can "
-                "reach that network.")
+        return ("NO ROUTE to a 100.x tailnet address - that one needs Tailscale running "
+                "on THIS pc. The https://<host>.ts.net address works anywhere while "
+                "Funnel is on, with nothing installed." if _tailnet(url) else
+                "NO ROUTE - nothing answered. Check the address; if it is a .ts.net "
+                "name, confirm Funnel is still on (tailscale funnel status).")
     if "refused" in e:
         return "REFUSED - address reached but nothing listening. Right port? Gateway running?"
     if "unknown url type" in e or "no host" in e:
@@ -429,8 +433,9 @@ def build_ui(tex):
                         with dpg.tab(label="Server"):
                             dpg.add_text("Jetson gateway")
                             dpg.add_input_text(tag="url", default_value=JETSON_URL, width=-1)
-                            dpg.add_text("Same network as the Jetson: use its LAN IP. "
-                                         "Off-site: the 100.x tailnet address.", wrap=300)
+                            dpg.add_text("The .ts.net address works from any machine "
+                                         "while Funnel is on. Same LAN as the Jetson? "
+                                         "http://<jetson-ip>:8000 is faster.", wrap=300)
                             dpg.add_input_text(label="API key", tag="key",
                                                default_value=API_KEY, width=150)
                             dpg.add_input_text(label="Task", tag="task",
@@ -611,12 +616,12 @@ def selftest():
                       ("http://jetson:8000/v1", "http://jetson:8000"),
                       ("drstreet.taildab2f8.ts.net", "https://drstreet.taildab2f8.ts.net")):
         assert _base(raw) == want, (raw, _base(raw))
-    assert _tailnet("https://drstreet.taildab2f8.ts.net")      # MagicDNS -> CGNAT
-    assert _tailnet("http://100.103.105.68:8000")
+    assert _tailnet("http://100.103.105.68:8000")              # CGNAT, tailnet only
+    assert not _tailnet("https://drstreet.taildab2f8.ts.net")  # Funnel: public ingress
     assert not _tailnet("http://192.168.1.9:8000")
     assert not _tailnet("http://100.20.3.4:8000")              # public 100.x, not CGNAT
-    assert "Tailscale must be running" in _hint("timed out", "http://100.103.105.68:8000")
-    assert "Tailscale" not in _hint("timed out", "http://192.168.1.9:8000")
+    assert "needs Tailscale" in _hint("timed out", "http://100.103.105.68:8000")
+    assert "Funnel is still on" in _hint("timed out", "https://x.ts.net")
     assert "REFUSED" in _hint("ConnectionRefusedError: refused")
     assert "KEY REJECTED" in _hint("HTTP 401: invalid API key")
     assert _hint("boom") == "boom"
