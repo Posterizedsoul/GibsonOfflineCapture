@@ -20,23 +20,36 @@ API_KEY = os.environ.get("GIBSON_API_KEY", "")     # avoids retyping it every la
 ZOOM = 1.13              # calibration knob: lens/sensor crop, tune per rig
 GAMMA = 1.0              # calibration knob: display only, 1.0 = raw passthrough
 PREVIEW_W = 900          # texture width, keep small - these are old machines
-PANEL_W = 300
+PANEL_W = 300            # at Normal text size; scales with the preset
 ROWS = 6                 # class-probability bars
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 LIGHTS = {1: "Ring_and_Small_Lights", 2: "Only_Ring_Light", 3: "Only_Small_Lights"}
+
+# Every size is rasterised as its own font. set_global_font_scale() stretches one
+# bitmap instead, which is exactly what made the text look smeared before.
+FAMILIES = {"Segoe UI": r"C:\Windows\Fonts\segoeui.ttf",
+            "Tahoma": r"C:\Windows\Fonts\tahoma.ttf",
+            "Consolas": r"C:\Windows\Fonts\consola.ttf"}
+ROLE_PT = {"small": 13, "body": 16, "head": 20, "big": 28}
+TEXT_SIZES = {"Small": 0.85, "Normal": 1.0, "Large": 1.2, "Huge": 1.45}
+
+GREEN, AMBER, RED = (90, 215, 125), (235, 185, 70), (235, 105, 105)
+HEAD_C, DIM_C = (235, 235, 240), (145, 145, 152)
 
 # Settings live in the user's own profile, so a git pull never clobbers them and
 # the API key is not in the repo. Plaintext: same trust level as the capture
 # folder itself - fine for a station PC, not for a shared login.
 CONF = os.path.join(os.path.expanduser("~"), ".gibson_capture.json")
 REMEMBER = ("url", "key", "vendor", "grade", "start_id", "total", "task",
-            "model_version", "tta", "interval", "timeout", "legacy_color", "boxes")
+            "model_version", "tta", "interval", "timeout", "legacy_color", "boxes",
+            "font_family", "text_size", "gamma")
 
 S = {
     "run": True, "frame": None, "preview": None,
     "id": 0, "img": 1, "last_id": -1, "session": False, "saved": 0,
     "detect": False, "pred": None, "drawn": None, "log": [], "dark": True,
-    "lut": None, "pw": PREVIEW_W, "ph": 0,
+    "lut": None, "pw": PREVIEW_W, "ph": 0, "panel": PANEL_W,
+    "fonts": {}, "roles": {}, "bars": {},
 }
 SAVE_Q = queue.Queue()   # capture never blocks the live feed
 
@@ -191,6 +204,11 @@ def _box(d):
     return None
 
 
+def conf_color(c):
+    """One rule for confidence everywhere: strong green, borderline amber, weak red."""
+    return GREEN if c >= 0.75 else AMBER if c >= 0.5 else RED
+
+
 def detect_loop():
     """Live detection: latest preview -> POST /v1/predict -> result. Own thread."""
     while S["run"]:
@@ -207,27 +225,28 @@ def detect_loop():
 
 def test_server():
     url = _base(dpg.get_value("url"))
-    set_status(f"testing {url} ...")
+    set_status(f"testing {url} ...", DIM_C)
     h = health(url, max(10.0, dpg.get_value("timeout")))
     if "error" in h:
-        set_status(f"{_hint(h['error'], url)}\n[{url}/health]  {h['error']}")
+        set_status(f"{_hint(h['error'], url)}\n[{url}/health]  {h['error']}", RED)
         return
     if not dpg.get_value("key"):
-        set_status(f"server up ({json.dumps(h)[:60]}) - now paste an API key")
+        set_status(f"Server up ({json.dumps(h)[:60]}) - now paste an API key", AMBER)
         return
     probe = S["preview"] if S["preview"] is not None else np.zeros((64, 64, 3), np.uint8)
     r = predict(url, dpg.get_value("key"), probe, dpg.get_value("task"),
                 dpg.get_value("model_version"), False, dpg.get_value("timeout"))
     if "error" in r:
-        set_status(f"server up, predict failed\n{_hint(r['error'], url)}\n{r['error']}")
+        set_status(f"Server up, predict failed\n{_hint(r['error'], url)}\n{r['error']}", RED)
         return
     S["pred"] = r
     save_conf()          # a key that just worked is worth remembering
-    set_status(f"OK - {r.get('model_id')}:{r.get('model_version')} "
-               f"answered {r.get('label')} in {r.get('latency_ms', 0):.0f} ms. Settings saved.")
+    set_status(f"CONNECTED - {r.get('model_id')}:{r.get('model_version')} answered "
+               f"{r.get('label')} in {r.get('latency_ms', 0):.0f} ms.  Settings saved.", GREEN)
 
 
-def set_status(msg):
+def set_status(msg, color=DIM_C):
+    dpg.configure_item("api_status", color=color)
     dpg.set_value("api_status", msg)
     log(msg.replace("\n", " | "))
 
@@ -289,6 +308,8 @@ def load_conf():
     for k in REMEMBER:
         if k in saved and dpg.does_item_exist(k):
             dpg.set_value(k, saved[k])
+    set_gamma(g=dpg.get_value("gamma"))
+    apply_look()
 
 
 def save_conf():
@@ -312,8 +333,21 @@ def start_session():
     log(f"Session started: IDs {S['id']}-{S['last_id']}")
 
 
+def set_detect(_=None, on=False):
+    """Live AI and capturing are separate modes: the operator is either grading
+    boards against the server or shooting a dataset, never both at once."""
+    S["detect"] = on
+    dpg.configure_item("cap_btn", enabled=not on,
+                       label="CAPTURE      Q" if not on else "CAPTURE  -  off in Live AI")
+    dpg.configure_item("raw_node", show=on)   # the server's own words, while predicting
+    log("Live AI on - capture disabled" if on else "Live AI off - capture enabled")
+
+
 def capture():
     """Queue the frame and return immediately - the feed keeps running."""
+    if S["detect"]:                      # also covers the Q key, not just the button
+        log("Turn Live AI off to capture")
+        return
     if S["frame"] is None:
         log("No camera frame yet - nothing to capture")
         return
@@ -344,16 +378,21 @@ def set_gamma(_=None, g=None):
 def draw_hud(img):
     """The operator's instruction goes ON the video, drawn by OpenCV: crisp at any
     size and independent of the GUI font."""
-    if S["session"]:
+    scale = img.shape[1] / 900          # HUD keeps its proportions at any preview size
+    if S["detect"]:
+        top, bottom = "LIVE AI", "CAPTURE DISABLED WHILE PREDICTING"
+    elif S["session"]:
         top = f"ID {S['id']}      SHOT {S['img']} OF 3"
         bottom = "SET LIGHTS:  " + LIGHTS[S["img"]].replace("_", " ").upper()
     else:
         top = "READY"
         bottom = f"PRESS  Q  TO START AT ID {dpg.get_value('start_id')}"
-    band = img[:86]
+    band = img[:int(86 * scale)]
     band[:] = cv2.addWeighted(band, 0.25, np.zeros_like(band), 0, 0)   # legible on any board
-    cv2.putText(img, top, (18, 36), FONT, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(img, bottom, (18, 71), FONT, 0.75, (170, 220, 170), 2, cv2.LINE_AA)
+    cv2.putText(img, top, (int(18 * scale), int(36 * scale)), FONT, 1.0 * scale,
+                (255, 255, 255), max(1, int(2 * scale)), cv2.LINE_AA)
+    cv2.putText(img, bottom, (int(18 * scale), int(71 * scale)), FONT, 0.75 * scale,
+                (150, 235, 170), max(1, int(2 * scale)), cv2.LINE_AA)
 
 
 def placeholder(msg, sub):
@@ -362,6 +401,46 @@ def placeholder(msg, sub):
     cv2.putText(img, msg, (30, S["ph"] // 2 - 8), FONT, 1.0, (210, 210, 210), 2, cv2.LINE_AA)
     cv2.putText(img, sub, (30, S["ph"] // 2 + 28), FONT, 0.55, (150, 150, 150), 1, cv2.LINE_AA)
     return img
+
+
+# ------------------------------------------------------------------ fonts
+def build_fonts():
+    """One crisp raster per (family, preset, role). Cheap enough to do all of them
+    up front, and switching is then just a rebind."""
+    have = {n: p for n, p in FAMILIES.items() if os.path.exists(p)}
+    if not have:
+        return ["Default"]
+    with dpg.font_registry():
+        for name, path in have.items():
+            for preset, mult in TEXT_SIZES.items():
+                for role, pt in ROLE_PT.items():
+                    S["fonts"][(name, preset, role)] = dpg.add_font(path, int(pt * mult))
+    return ["Default"] + list(have)
+
+
+def role(item, kind):
+    """Tag an item so apply_look() can give it the right size."""
+    S["roles"].setdefault(kind, []).append(item)
+    return item
+
+
+def apply_look(*_):
+    """Rebind every tagged item to the chosen family and size preset."""
+    fam, preset = dpg.get_value("font_family"), dpg.get_value("text_size")
+    mult = TEXT_SIZES.get(preset, 1.0)
+    S["panel"] = int(PANEL_W * mult)
+    dpg.configure_item("side", width=S["panel"])
+    if fam != "Default" and S["fonts"]:
+        dpg.bind_font(S["fonts"][(fam, preset, "body")])
+        for kind, items in S["roles"].items():
+            for it in items:
+                dpg.bind_item_font(it, S["fonts"][(fam, preset, kind)])
+    else:
+        dpg.bind_font(0)
+        for items in S["roles"].values():
+            for it in items:
+                dpg.bind_item_font(it, 0)
+    fit_image()
 
 
 # ------------------------------------------------------------------ look
@@ -380,7 +459,7 @@ def make_theme(dark):
                 dpg.add_theme_style(k, v, category=dpg.mvThemeCat_Core)
             dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 10, 7, category=dpg.mvThemeCat_Core)
             dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 9, 8, category=dpg.mvThemeCat_Core)
-            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 12, 10,
+            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 14, 12,
                                 category=dpg.mvThemeCat_Core)
             for k, v in ((dpg.mvThemeCol_WindowBg, bg), (dpg.mvThemeCol_ChildBg, child),
                          (dpg.mvThemeCol_PopupBg, child), (dpg.mvThemeCol_FrameBg, frame),
@@ -392,10 +471,16 @@ def make_theme(dark):
                          (dpg.mvThemeCol_TabActive, act), (dpg.mvThemeCol_Border, frame),
                          (dpg.mvThemeCol_Text, txt), (dpg.mvThemeCol_TextDisabled, dim),
                          (dpg.mvThemeCol_SliderGrab, txt), (dpg.mvThemeCol_SliderGrabActive, txt),
-                         (dpg.mvThemeCol_CheckMark, txt), (dpg.mvThemeCol_PlotHistogram, txt),
-                         (dpg.mvThemeCol_ScrollbarBg, child), (dpg.mvThemeCol_ScrollbarGrab, frame),
-                         (dpg.mvThemeCol_Separator, frame)):
+                         (dpg.mvThemeCol_CheckMark, txt), (dpg.mvThemeCol_ScrollbarBg, child),
+                         (dpg.mvThemeCol_ScrollbarGrab, frame), (dpg.mvThemeCol_Separator, frame)):
                 dpg.add_theme_color(k, v, category=dpg.mvThemeCat_Core)
+    return t
+
+
+def bar_theme(rgb):
+    with dpg.theme() as t:
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_color(dpg.mvThemeCol_PlotHistogram, rgb, category=dpg.mvThemeCat_Core)
     return t
 
 
@@ -406,122 +491,176 @@ def toggle_theme():
 
 def fit_image(*_):
     """Scale the preview to whatever room the window currently has."""
-    w = dpg.get_viewport_client_width() - PANEL_W - 70
+    w = dpg.get_viewport_client_width() - S["panel"] - 70
     h = dpg.get_viewport_client_height() - 130       # tab bar + last-event line
     s = max(0.15, min(w / S["pw"], h / S["ph"]))
     dpg.configure_item("img", width=int(S["pw"] * s), height=int(S["ph"] * s))
 
 
-def set_scale(_, v):
-    dpg.set_global_font_scale(v)
-    fit_image()
-
-
 # ------------------------------------------------------------------ ui
-def build_ui(tex):
+def section(text):
+    """A titled block: heading in the head size, then a rule."""
+    role(dpg.add_text(text.upper(), color=HEAD_C), "head")
+    dpg.add_separator()
+
+
+def note(text):
+    """Small dim explanatory line."""
+    return role(dpg.add_text(text, color=DIM_C, wrap=560), "small")
+
+
+def build_ui(tex, families):
     with dpg.texture_registry():
         dpg.add_raw_texture(S["pw"], S["ph"], tex, format=dpg.mvFormat_Float_rgb, tag="tex")
+
+    S["bars"] = {c: bar_theme(c) for c in (GREEN, AMBER, RED, (95, 95, 100))}
 
     with dpg.window(tag="root"):
         with dpg.tab_bar():
 
             # ============================================== the working screen
-            with dpg.tab(label="  Capture  "):
+            with dpg.tab(label="   Capture   "):
                 with dpg.group(horizontal=True):
                     dpg.add_image("tex", tag="img")
 
-                    with dpg.child_window(width=PANEL_W, autosize_y=True):
+                    with dpg.child_window(width=S["panel"], autosize_y=True, tag="side"):
                         dpg.add_button(label="CAPTURE      Q", callback=capture,
-                                       width=-1, height=64)
-                        dpg.add_text("", tag="counts")
-                        dpg.add_separator()
+                                       width=-1, height=66, tag="cap_btn")
+                        with dpg.group(horizontal=True):
+                            role(dpg.add_text("0", tag="c_saved", color=GREEN), "head")
+                            note("saved")
+                            role(dpg.add_text("0", tag="c_queue", color=DIM_C), "head")
+                            note("queued")
+                        dpg.add_spacer(height=6)
 
-                        dpg.add_text("NEXT")
-                        dpg.add_text("", tag="next_light", wrap=270)
-                        dpg.add_separator()
+                        section("Next")
+                        role(dpg.add_text("", tag="next_light", wrap=260), "head")
+                        note("press Q, then set this lighting for the following shot")
+                        dpg.add_spacer(height=6)
 
-                        dpg.add_checkbox(label="Live AI", tag="detect_cb",
-                                         callback=lambda s, v: S.__setitem__("detect", v))
-                        dpg.add_text("-", tag="pred_label", wrap=270)
+                        section("Picture")
+                        dpg.add_slider_float(label="Gamma", tag="gamma",
+                                             default_value=GAMMA, min_value=0.4,
+                                             max_value=3.0, width=-70,
+                                             callback=lambda s, v: set_gamma(g=v))
+                        note("display only, saved files are untouched")
+                        dpg.add_spacer(height=6)
+
+                        section("Live AI")
+                        dpg.add_checkbox(label="Predict continuously", tag="detect_cb",
+                                         callback=set_detect)
+                        dpg.add_slider_float(label="Every s", tag="interval",
+                                             default_value=1.0, min_value=0.2,
+                                             max_value=10.0, width=-70)
+                        role(dpg.add_text("-", tag="pred_label", wrap=260, color=DIM_C), "big")
                         for i in range(ROWS):
-                            dpg.add_progress_bar(tag=f"bar{i}", width=-1,
-                                                 overlay="", show=False)
-                dpg.add_text("", tag="last")
+                            dpg.add_progress_bar(tag=f"bar{i}", width=-1, overlay="", show=False)
+                        note("green above 75%, amber above 50%, red below")
+                        with dpg.tree_node(label="Raw response", tag="raw_node",
+                                           show=False, default_open=True):
+                            role(dpg.add_text("", tag="pred_raw_live", wrap=250,
+                                              color=DIM_C), "small")
+                role(dpg.add_text("", tag="last", color=DIM_C), "small")
 
-            # ============================================== setup, touched once
-            with dpg.tab(label="  Setup  "):
-                dpg.add_text("Where the images go")
+            # ============================================== everything else, two columns
+            with dpg.tab(label="   Settings   "):
                 with dpg.group(horizontal=True):
-                    dpg.add_input_text(label="Vendor", tag="vendor",
-                                       default_value="Electric_Hardwood", width=200)
-                    dpg.add_input_text(label="Grade", tag="grade",
-                                       default_value="2A", width=120)
-                dpg.add_text(SAVE_ROOT + r"\<vendor>\<grade>\<id>\<time>_<n>_<lighting>.jpg")
-                dpg.add_spacer(height=8)
 
-                dpg.add_text("Board IDs")
-                with dpg.group(horizontal=True):
-                    dpg.add_input_int(label="Start ID", tag="start_id",
-                                      default_value=147, width=140)
-                    dpg.add_input_int(label="How many", tag="total",
-                                      default_value=5000, width=140)
-                dpg.add_button(label="Restart session at Start ID",
-                               callback=start_session, width=320, height=32)
-                dpg.add_spacer(height=8)
+                    # ---------------------------------- left: this station
+                    with dpg.child_window(width=520, autosize_y=True):
+                        section("Where the images go")
+                        with dpg.group(horizontal=True):
+                            dpg.add_input_text(label="Vendor", tag="vendor",
+                                               default_value="Electric_Hardwood", width=200)
+                            dpg.add_spacer(width=16)
+                            dpg.add_input_text(label="Grade", tag="grade",
+                                               default_value="2A", width=110)
+                        note(SAVE_ROOT + r"\<vendor>\<grade>\<id>" "\n"
+                             r"      \<time>_<shot>_<lighting>.jpg")
+                        dpg.add_spacer(height=12)
 
-                dpg.add_text("Picture")
-                dpg.add_slider_float(label="Gamma (display only)", default_value=GAMMA,
-                                     min_value=0.4, max_value=3.0, width=200,
-                                     callback=lambda s, v: set_gamma(g=v))
-                dpg.add_slider_float(label="UI scale", default_value=1.0, min_value=0.7,
-                                     max_value=2.0, width=200, callback=set_scale)
-                dpg.add_button(label="Light / dark", callback=toggle_theme, width=200)
-                dpg.add_checkbox(label="Legacy colour on save", tag="legacy_color",
-                                 default_value=True)
-                dpg.add_text("On = byte-identical to the old script (R and B swapped "
-                             "in the file). Off = the file matches the screen.", wrap=520)
+                        section("Board IDs")
+                        with dpg.group(horizontal=True):
+                            dpg.add_input_int(label="Start ID", tag="start_id",
+                                              default_value=147, width=140)
+                            dpg.add_spacer(width=16)
+                            dpg.add_input_int(label="How many", tag="total",
+                                              default_value=5000, width=140)
+                        dpg.add_button(label="Restart session at Start ID",
+                                       callback=start_session, width=-1, height=34)
+                        note("Not needed to begin - the first capture starts the "
+                             "session. The saved Start ID is wherever you got to, so "
+                             "a relaunch resumes instead of repeating a board.")
+                        dpg.add_spacer(height=12)
 
-            # ============================================== server
-            with dpg.tab(label="  Server  "):
-                dpg.add_text("Jetson gateway")
-                dpg.add_input_text(tag="url", default_value=JETSON_URL, width=520)
-                dpg.add_text("The .ts.net address works from any machine while Funnel "
-                             "is on. Same LAN as the Jetson? http://<jetson-ip>:8000 "
-                             "is faster.", wrap=520)
-                dpg.add_input_text(label="API key", tag="key",
-                                   default_value=API_KEY, width=320)
-                dpg.add_text(f"Typed once: saved to {CONF} on a passing test and on "
-                             f"exit, along with the rest of this screen.", wrap=520)
-                dpg.add_spacer(height=8)
+                        section("Saved files")
+                        dpg.add_checkbox(label="Legacy colour on save", tag="legacy_color",
+                                         default_value=True)
+                        note("On = byte-identical to the old script (R and B swapped "
+                             "in the file). Off = the file matches the screen.")
+                        dpg.add_spacer(height=12)
 
-                dpg.add_text("Model")
-                dpg.add_input_text(label="Task", tag="task",
-                                   default_value="classification", width=200)
-                dpg.add_input_text(label="Model version", tag="model_version",
-                                   default_value="", width=200, hint="blank = active model")
-                dpg.add_checkbox(label="TTA", tag="tta")
-                dpg.add_spacer(height=8)
+                        section("Appearance")
+                        with dpg.group(horizontal=True):
+                            dpg.add_combo(families, label="Font", tag="font_family",
+                                          default_value=families[min(1, len(families) - 1)],
+                                          width=150, callback=apply_look)
+                            dpg.add_spacer(width=16)
+                            dpg.add_combo(list(TEXT_SIZES), label="Size", tag="text_size",
+                                          default_value="Normal", width=120,
+                                          callback=apply_look)
+                        dpg.add_button(label="Light / dark", callback=toggle_theme,
+                                       width=-1, height=34)
 
-                dpg.add_text("Live AI")
-                dpg.add_slider_float(label="Predict every (s)", tag="interval",
-                                     default_value=1.0, min_value=0.2, max_value=10.0,
-                                     width=200)
-                dpg.add_input_float(label="Timeout (s)", tag="timeout", default_value=8.0,
-                                    min_value=1.0, max_value=60.0, step=1.0, width=200)
-                dpg.add_checkbox(label="Draw boxes on the feed", tag="boxes",
-                                 default_value=True)
-                dpg.add_spacer(height=8)
+                    # ---------------------------------- right: the Jetson
+                    with dpg.child_window(width=-1, autosize_y=True):
+                        section("Gateway")
+                        dpg.add_input_text(label="URL", tag="url",
+                                           default_value=JETSON_URL, width=-110)
+                        dpg.add_input_text(label="API key", tag="key",
+                                           default_value=API_KEY, width=-110)
+                        note("The .ts.net address works from any machine while Funnel "
+                             "is on. On the same LAN as the Jetson, "
+                             "http://<jetson-ip>:8000 is faster.")
+                        note(f"Typed once - saved to {CONF} when a test passes "
+                             f"and again on exit.")
+                        dpg.add_spacer(height=12)
 
-                dpg.add_button(label="Test connection", width=320, height=34,
-                               callback=lambda: threading.Thread(target=test_server,
-                                                                 daemon=True).start())
-                dpg.add_text("", tag="api_status", wrap=520)
-                with dpg.tree_node(label="Last raw response"):
-                    dpg.add_text("", tag="pred_raw", wrap=520)
+                        section("Model")
+                        with dpg.group(horizontal=True):
+                            dpg.add_input_text(label="Task", tag="task",
+                                               default_value="classification", width=190)
+                            dpg.add_spacer(width=16)
+                            dpg.add_checkbox(label="TTA", tag="tta")
+                        dpg.add_input_text(label="Version", tag="model_version",
+                                           default_value="", width=190,
+                                           hint="blank = active model")
+                        dpg.add_spacer(height=12)
+
+                        section("Live AI")
+                        dpg.add_input_float(label="Timeout (s)", tag="timeout",
+                                            default_value=8.0, min_value=1.0,
+                                            max_value=60.0, step=1.0, width=150)
+                        dpg.add_checkbox(label="Draw boxes on the feed", tag="boxes",
+                                         default_value=True)
+                        note("The switch and the interval are on the Capture tab, "
+                             "beside the video.")
+                        dpg.add_spacer(height=12)
+
+                        section("Connection")
+                        dpg.add_button(label="Test connection", width=-1, height=36,
+                                       callback=lambda: threading.Thread(
+                                           target=test_server, daemon=True).start())
+                        role(dpg.add_text("not tested yet", tag="api_status", wrap=460,
+                                          color=DIM_C), "body")
+                        with dpg.tree_node(label="Last raw response"):
+                            role(dpg.add_text("", tag="pred_raw", wrap=460,
+                                              color=DIM_C), "small")
 
             # ============================================== log
-            with dpg.tab(label="  Log  "):
-                dpg.add_text("", tag="log")
+            with dpg.tab(label="   Log   "):
+                section("Everything that happened")
+                role(dpg.add_text("", tag="log"), "small")
 
     with dpg.handler_registry():
         dpg.add_key_press_handler(dpg.mvKey_Q, callback=capture)
@@ -540,9 +679,10 @@ def draw_boxes(preview):
     for d in (p.get("detections") or [])[:20]:
         b = _box(d) if isinstance(d, dict) else None
         if b:
-            cv2.rectangle(preview, b[:2], b[2:], (255, 255, 255), 2)
+            c = conf_color(_conf(d))[::-1]           # RGB constant -> BGR frame
+            cv2.rectangle(preview, b[:2], b[2:], c, 2)
             cv2.putText(preview, f"{_label(d)} {_conf(d):.2f}", (b[0], max(12, b[1] - 6)),
-                        FONT, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+                        FONT, 0.45, c, 1, cv2.LINE_AA)
 
 
 def show_pred():
@@ -553,24 +693,36 @@ def show_pred():
         return
     S["drawn"] = p
 
+    raw = json.dumps(p, indent=1)[:2000]
+    dpg.set_value("pred_raw", raw)
+    dpg.set_value("pred_raw_live", raw)
+
     if isinstance(p, dict) and "error" in p:
-        dpg.set_value("pred_label", "AI ERROR - see Server tab")
+        dpg.configure_item("pred_label", color=RED)
+        dpg.set_value("pred_label", "AI ERROR - see Settings")
         for i in range(ROWS):
             dpg.hide_item(f"bar{i}")
         return
 
     ranked = _ranked(p)
-    dpg.set_value("pred_label", f"{ranked[0][0]}   {ranked[0][1] * 100:.1f}%   "
-                                f"({p.get('latency_ms', 0):.0f} ms)"
-                  if ranked else "no prediction")
+    if ranked:
+        top, conf = ranked[0]
+        dpg.configure_item("pred_label", color=conf_color(conf))
+        dpg.set_value("pred_label", f"{top}   {conf * 100:.1f}%")
+    else:
+        dpg.configure_item("pred_label", color=DIM_C)
+        dpg.set_value("pred_label", "no prediction")
+
     for i in range(ROWS):
         if i < len(ranked):
-            dpg.configure_item(f"bar{i}", show=True,
-                               overlay=f"{ranked[i][0]}   {ranked[i][1] * 100:.1f}%")
-            dpg.set_value(f"bar{i}", min(1.0, ranked[i][1]))
+            name, c = ranked[i]
+            dpg.configure_item(f"bar{i}", show=True, overlay=f"{name}   {c * 100:.1f}%")
+            dpg.set_value(f"bar{i}", min(1.0, c))
+            # only the winner carries the confidence colour; the rest stay quiet
+            dpg.bind_item_theme(f"bar{i}", S["bars"][conf_color(c) if i == 0
+                                                     else (95, 95, 100)])
         else:
             dpg.hide_item(f"bar{i}")
-    dpg.set_value("pred_raw", json.dumps(p)[:2000])
 
 
 def main():
@@ -600,9 +752,11 @@ def main():
     dpg.create_context()
     dpg.create_viewport(title="Gibson Capture", width=1360, height=860,
                         min_width=760, min_height=560)
-    build_ui(tex)
+    families = build_fonts()
+    build_ui(tex, families)
     dpg.setup_dearpygui()
     load_conf()
+    apply_look()
     dpg.show_viewport()
     fit_image()
 
@@ -633,7 +787,10 @@ def main():
             show_pred()
             dpg.set_value("next_light", LIGHTS[S["img"]].replace("_", " ")
                           if S["session"] else "press Q to begin")
-            dpg.set_value("counts", f"saved {S['saved']}    queue {SAVE_Q.qsize()}")
+            dpg.set_value("c_saved", str(S["saved"]))
+            n = SAVE_Q.qsize()
+            dpg.set_value("c_queue", str(n))
+            dpg.configure_item("c_queue", color=AMBER if n else DIM_C)
             dpg.render_dearpygui_frame()
     finally:
         S["run"] = False
@@ -665,6 +822,8 @@ def selftest():
     assert _ranked({"label": "x", "confidence": .5}) == [("x", .5)]
     assert _ranked({"detections": [{"class": "knot", "score": .8}]}) == [("knot", .8)]
     assert _ranked({"nope": 1}) == []
+    assert conf_color(.9) == GREEN and conf_color(.6) == AMBER and conf_color(.2) == RED
+    assert conf_color(.75) == GREEN and conf_color(.5) == AMBER      # boundaries
     for raw, want in (("100.103.105.68:8000", "http://100.103.105.68:8000"),
                       ("http://192.168.1.9:8000/", "http://192.168.1.9:8000"),
                       (" http://jetson:8000/ui ", "http://jetson:8000"),
