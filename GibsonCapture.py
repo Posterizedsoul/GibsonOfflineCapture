@@ -6,6 +6,7 @@ import json
 import uuid
 import queue
 import threading
+import urllib.error
 import urllib.request
 import numpy as np
 import dearpygui.dearpygui as dpg
@@ -14,55 +15,95 @@ import dearpygui.dearpygui as dpg
 # CONFIGURATION (most of it editable in the GUI at runtime)
 # ==========================================
 SAVE_ROOT = r"C:\Gibson"
-JETSON_URL = "http://jetson.local:8000/predict"
+JETSON_URL = "http://100.103.105.68:8000"          # Tailscale address, see ACCESS.md
+API_KEY = os.environ.get("GIBSON_API_KEY", "")     # avoids retyping it every launch
 ZOOM = 1.13              # calibration knob: lens/sensor crop, tune per rig
 GAMMA = 1.0              # calibration knob: display only, 1.0 = raw passthrough
 PREVIEW_W = 760          # texture width, keep small - these are old machines
-PANEL_W = 330
+PANEL_W = 340
+ROWS = 6                 # class-probability bars in the detection tab
 FONTS = (r"C:\Windows\Fonts\segoeui.ttf", r"C:\Windows\Fonts\arial.ttf")
 LIGHTS = {1: "Ring_and_Small_Lights", 2: "Only_Ring_Light", 3: "Only_Small_Lights"}
 
 S = {
     "run": True, "frame": None, "preview": None,
     "id": 0, "img": 1, "last_id": -1, "session": False,
-    "detect": False, "pred": None, "ms": 0, "log": [], "dark": True,
+    "detect": False, "pred": None, "drawn": None, "log": [], "dark": True,
     "lut": None, "pw": PREVIEW_W, "ph": 0, "fonts": {},
 }
 SAVE_Q = queue.Queue()   # capture never blocks the live feed
 
 
 # ------------------------------------------------------------------ Jetson API
-def _multipart(jpg, field="file", name="frame.jpg"):
-    """Build a multipart/form-data body without pulling in `requests`."""
+def _multipart(fields=(), files=()):
+    """multipart/form-data body. fields: (name, value); files: (name, filename, bytes).
+    Repeated names are how the API takes several images, so this takes lists."""
     b = uuid.uuid4().hex
-    body = (
-        f"--{b}\r\nContent-Disposition: form-data; name=\"{field}\"; "
-        f"filename=\"{name}\"\r\nContent-Type: image/jpeg\r\n\r\n"
-    ).encode() + jpg + f"\r\n--{b}--\r\n".encode()
-    return body, f"multipart/form-data; boundary={b}"
+    out = bytearray()
+    for k, v in fields:
+        out += (f"--{b}\r\nContent-Disposition: form-data; "
+                f"name=\"{k}\"\r\n\r\n{v}\r\n").encode()
+    for k, fn, data in files:
+        out += (f"--{b}\r\nContent-Disposition: form-data; name=\"{k}\"; "
+                f"filename=\"{fn}\"\r\nContent-Type: image/jpeg\r\n\r\n").encode() + data + b"\r\n"
+    out += f"--{b}--\r\n".encode()
+    return bytes(out), f"multipart/form-data; boundary={b}"
 
 
-def post_frame(url, bgr, field="file", timeout=4.0):
-    ok, jpg = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+def _call(url, key, timeout, body=None, ctype=None):
+    """Every endpoint wants X-API-Key; 401/403/422 come back as JSON detail."""
+    headers = {"X-API-Key": key} if key else {}
+    if ctype:
+        headers["Content-Type"] = ctype
+    req = urllib.request.Request(url, data=body, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as ex:
+        detail = ex.read().decode(errors="replace")[:300]
+        try:
+            detail = json.loads(detail).get("detail", detail)
+        except Exception:
+            pass
+        return {"error": f"HTTP {ex.code}: {detail}"}
+    except Exception as ex:
+        return {"error": f"{type(ex).__name__}: {ex}"}
+
+
+def predict(base, key, bgr, task="classification", model_version="", tta=False, timeout=8.0):
+    """POST /v1/predict - stateless: the server runs the active model and answers,
+    nothing is stored. Field name is `images` and it may repeat for multi-view."""
+    ok, jpg = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
     if not ok:
-        raise RuntimeError("jpeg encode failed")
-    body, ctype = _multipart(jpg.tobytes(), field)
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": ctype})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
+        return {"error": "jpeg encode failed"}
+    fields = [("task", task), ("tta", "true" if tta else "false")]
+    if model_version:
+        fields.append(("model_version", model_version))
+    body, ctype = _multipart(fields, [("images", "frame.jpg", jpg.tobytes())])
+    return _call(base.rstrip("/") + "/v1/predict", key, timeout, body, ctype)
 
 
-def _preds(resp):
-    """Normalise the common response shapes into a list of detections."""
-    if isinstance(resp, list):
-        return resp
+def health(base, timeout=5.0):
+    """GET /health - no key required, so it separates 'network down' from 'bad key'."""
+    return _call(base.rstrip("/") + "/health", "", timeout)
+
+
+def _ranked(resp):
+    """[(label, prob)] best first. The server returns probs{class: p}; the other
+    shapes are here so a plain detector or a bare list still renders."""
+    if isinstance(resp, dict) and isinstance(resp.get("probs"), dict):
+        return sorted(resp["probs"].items(), key=lambda kv: kv[1], reverse=True)
+    items = resp if isinstance(resp, list) else []
     if isinstance(resp, dict):
         for k in ("predictions", "detections", "results", "objects"):
             if isinstance(resp.get(k), list):
-                return resp[k]
-        if any(k in resp for k in ("class", "label", "name")):
-            return [resp]
-    return []
+                items = resp[k]
+                break
+        else:
+            if resp.get("label"):
+                return [(str(resp["label"]), float(resp.get("confidence") or 0))]
+    return sorted(((_label(d), _conf(d)) for d in items if isinstance(d, dict)),
+                  key=lambda kv: kv[1], reverse=True)
 
 
 def _label(d):
@@ -87,16 +128,13 @@ def _box(d):
 
 
 def send_once(frame_bgr):
-    """One round trip. Returns the parsed response or an {'error': ...} dict."""
-    try:
-        return post_frame(dpg.get_value("url"), frame_bgr,
-                          dpg.get_value("field"), dpg.get_value("timeout"))
-    except Exception as ex:
-        return {"error": f"{type(ex).__name__}: {ex}"}
+    return predict(dpg.get_value("url"), dpg.get_value("key"), frame_bgr,
+                   dpg.get_value("task"), dpg.get_value("model_version"),
+                   dpg.get_value("tta"), dpg.get_value("timeout"))
 
 
 def detect_loop():
-    """Live detection: grab latest preview -> POST -> result. Own thread."""
+    """Live detection: latest preview -> POST /v1/predict -> result. Own thread."""
     while S["run"]:
         f = S["preview"]
         if not S["detect"] or f is None:
@@ -104,8 +142,26 @@ def detect_loop():
             continue
         t = time.time()
         S["pred"] = send_once(f)
-        S["ms"] = int((time.time() - t) * 1000)
         time.sleep(max(0.0, dpg.get_value("interval") - (time.time() - t)))
+
+
+def test_server():
+    h = health(dpg.get_value("url"))
+    if "error" in h:
+        set_status(f"unreachable - {h['error']}")
+        return
+    if S["preview"] is None:
+        set_status(f"reachable: {json.dumps(h)[:80]} (no frame yet to predict)")
+        return
+    r = send_once(S["preview"])
+    S["pred"] = r
+    set_status(f"HEALTH ok / PREDICT {r['error']}" if "error" in r else
+               f"HEALTH ok / PREDICT ok - {r.get('model_id')}:{r.get('model_version')}")
+
+
+def set_status(msg):
+    dpg.set_value("api_status", msg)
+    log(msg)
 
 
 # ------------------------------------------------------------------ capture queue
@@ -147,8 +203,8 @@ def grab(cam):
 
 # ------------------------------------------------------------------ session
 def log(msg):
-    S["log"] = (S["log"] + [f"{time.strftime('%H:%M:%S')}  {msg}"])[-40:]
-    dpg.set_value("log", "\n".join(S["log"]))
+    S["log"] = (S["log"] + [f"{time.strftime('%H:%M:%S')}  {msg}"])[-200:]
+    dpg.set_value("log", "\n".join(S["log"][-40:]))
 
 
 def start_session():
@@ -199,7 +255,7 @@ def make_theme(dark):
         with dpg.theme_component(dpg.mvAll):
             for k, v in ((dpg.mvStyleVar_FrameRounding, 5), (dpg.mvStyleVar_ChildRounding, 7),
                          (dpg.mvStyleVar_WindowRounding, 7), (dpg.mvStyleVar_GrabRounding, 5),
-                         (dpg.mvStyleVar_FrameBorderSize, 1), (dpg.mvStyleVar_WindowPadding, 10)):
+                         (dpg.mvStyleVar_TabRounding, 5), (dpg.mvStyleVar_FrameBorderSize, 1)):
                 dpg.add_theme_style(k, v, category=dpg.mvThemeCat_Core)
             dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 9, 6, category=dpg.mvThemeCat_Core)
             dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 8, 7, category=dpg.mvThemeCat_Core)
@@ -209,11 +265,13 @@ def make_theme(dark):
                          (dpg.mvThemeCol_Button, btn), (dpg.mvThemeCol_ButtonHovered, hov),
                          (dpg.mvThemeCol_ButtonActive, act), (dpg.mvThemeCol_Header, frame),
                          (dpg.mvThemeCol_HeaderHovered, hov), (dpg.mvThemeCol_HeaderActive, act),
-                         (dpg.mvThemeCol_Border, frame), (dpg.mvThemeCol_Text, txt),
-                         (dpg.mvThemeCol_TextDisabled, dim), (dpg.mvThemeCol_SliderGrab, txt),
-                         (dpg.mvThemeCol_SliderGrabActive, txt), (dpg.mvThemeCol_CheckMark, txt),
-                         (dpg.mvThemeCol_PlotHistogram, txt), (dpg.mvThemeCol_ScrollbarBg, child),
-                         (dpg.mvThemeCol_ScrollbarGrab, frame), (dpg.mvThemeCol_Separator, frame)):
+                         (dpg.mvThemeCol_Tab, frame), (dpg.mvThemeCol_TabHovered, hov),
+                         (dpg.mvThemeCol_TabActive, act), (dpg.mvThemeCol_Border, frame),
+                         (dpg.mvThemeCol_Text, txt), (dpg.mvThemeCol_TextDisabled, dim),
+                         (dpg.mvThemeCol_SliderGrab, txt), (dpg.mvThemeCol_SliderGrabActive, txt),
+                         (dpg.mvThemeCol_CheckMark, txt), (dpg.mvThemeCol_PlotHistogram, txt),
+                         (dpg.mvThemeCol_ScrollbarBg, child), (dpg.mvThemeCol_ScrollbarGrab, frame),
+                         (dpg.mvThemeCol_Separator, frame)):
                 dpg.add_theme_color(k, v, category=dpg.mvThemeCat_Core)
     return t
 
@@ -226,7 +284,7 @@ def toggle_theme():
 def fit_image(*_):
     """Scale the preview to whatever room the window currently has."""
     w = dpg.get_viewport_client_width() - PANEL_W - 46
-    h = dpg.get_viewport_client_height() - 235          # status line + log strip
+    h = dpg.get_viewport_client_height() - 245          # status line + log strip
     s = max(0.15, min(w / S["pw"], h / S["ph"]))
     dpg.configure_item("img", width=int(S["pw"] * s), height=int(S["ph"] * s))
 
@@ -241,7 +299,7 @@ def build_ui(tex):
     for p in FONTS:
         if os.path.exists(p):
             with dpg.font_registry():
-                S["fonts"] = {n: dpg.add_font(p, n) for n in (17, 22, 34)}
+                S["fonts"] = {n: dpg.add_font(p, n) for n in (17, 21, 32)}
             dpg.bind_font(S["fonts"][17])
             break
 
@@ -250,67 +308,90 @@ def build_ui(tex):
 
     with dpg.window(tag="root"):
         with dpg.group(horizontal=True):
-            # ---------------- live feed -------------------------------------
+            # ------------------------------------------------ live feed
             with dpg.child_window(width=-(PANEL_W + 8), autosize_y=True, border=False):
                 dpg.add_image("tex", tag="img")
                 dpg.add_text("No active session", tag="hud")
-                with dpg.child_window(height=120):
+                with dpg.child_window(height=118):
                     dpg.add_text("", tag="log")
 
-            # ---------------- controls --------------------------------------
-            with dpg.child_window(width=PANEL_W, autosize_y=True):
-                dpg.add_button(label="CAPTURE   (Q)", callback=capture, width=-1, height=58)
+            # ------------------------------------------------ controls
+            with dpg.child_window(width=PANEL_W, autosize_y=True, border=False):
+                with dpg.child_window(height=-96):
+                    with dpg.tab_bar():
+
+                        with dpg.tab(label="Capture"):
+                            dpg.add_input_text(label="Vendor", tag="vendor",
+                                               default_value="Electric_Hardwood", width=130)
+                            dpg.add_input_text(label="Grade", tag="grade",
+                                               default_value="2A", width=130)
+                            dpg.add_input_int(label="Start ID", tag="start_id",
+                                              default_value=147, width=130)
+                            dpg.add_input_int(label="Total IDs", tag="total",
+                                              default_value=5000, width=130)
+                            dpg.add_button(label="Start session", callback=start_session,
+                                           width=-1, height=32)
+                            dpg.add_separator()
+                            dpg.add_text("Saving to")
+                            dpg.add_text(SAVE_ROOT, tag="path_hint", wrap=290)
+
+                        with dpg.tab(label="Detection"):
+                            dpg.add_checkbox(label="Run live detection", tag="detect_cb",
+                                             callback=lambda s, v: S.__setitem__("detect", v))
+                            dpg.add_slider_float(label="Every s", tag="interval",
+                                                 default_value=1.0, min_value=0.2,
+                                                 max_value=10.0, width=110)
+                            dpg.add_checkbox(label="Draw boxes", tag="boxes", default_value=True)
+                            dpg.add_separator()
+                            dpg.add_text("-", tag="pred_label")
+                            dpg.add_text("", tag="pred_meta", wrap=300)
+                            dpg.add_spacer(height=4)
+                            for i in range(ROWS):
+                                dpg.add_progress_bar(tag=f"bar{i}", width=-1,
+                                                     overlay="", show=False)
+                            with dpg.tree_node(label="Raw response"):
+                                dpg.add_text("", tag="pred_raw", wrap=300)
+
+                        with dpg.tab(label="Server"):
+                            dpg.add_text("Jetson gateway")
+                            dpg.add_input_text(tag="url", default_value=JETSON_URL, width=-1)
+                            dpg.add_input_text(label="API key", tag="key", password=True,
+                                               default_value=API_KEY, width=150)
+                            dpg.add_input_text(label="Task", tag="task",
+                                               default_value="classification", width=150)
+                            dpg.add_input_text(label="Model ver", tag="model_version",
+                                               default_value="", width=150,
+                                               hint="blank = active model")
+                            dpg.add_checkbox(label="TTA", tag="tta")
+                            dpg.add_input_float(label="Timeout s", tag="timeout",
+                                                default_value=8.0, min_value=1.0,
+                                                max_value=60.0, step=1.0, width=110)
+                            dpg.add_button(label="Test connection", width=-1, height=32,
+                                           callback=lambda: threading.Thread(
+                                               target=test_server, daemon=True).start())
+                            dpg.add_text("", tag="api_status", wrap=300)
+
+                        with dpg.tab(label="View"):
+                            dpg.add_slider_float(label="Gamma", default_value=GAMMA,
+                                                 min_value=0.4, max_value=3.0, width=110,
+                                                 callback=lambda s, v: set_gamma(g=v))
+                            dpg.add_slider_float(label="UI scale", default_value=1.0,
+                                                 min_value=0.7, max_value=2.0, width=110,
+                                                 callback=set_scale)
+                            dpg.add_button(label="Light / dark", callback=toggle_theme, width=-1)
+                            dpg.add_separator()
+                            dpg.add_checkbox(label="Legacy colour on save",
+                                             tag="legacy_color", default_value=True)
+                            dpg.add_text("On = byte-identical to the old script "
+                                         "(R and B swapped in the file).", wrap=300)
+
+                # pinned: never hidden behind a tab
+                dpg.add_button(label="CAPTURE   (Q)", callback=capture, width=-1, height=56)
                 dpg.add_text("Queue: 0", tag="qstat")
-                dpg.add_separator()
-
-                with dpg.collapsing_header(label="Session", default_open=True):
-                    dpg.add_input_text(label="Vendor", tag="vendor",
-                                       default_value="Electric_Hardwood", width=140)
-                    dpg.add_input_text(label="Grade", tag="grade", default_value="2A", width=140)
-                    dpg.add_input_int(label="Start ID", tag="start_id",
-                                      default_value=147, width=140)
-                    dpg.add_input_int(label="Total IDs", tag="total",
-                                      default_value=5000, width=140)
-                    dpg.add_button(label="Start session", callback=start_session,
-                                   width=-1, height=32)
-
-                with dpg.collapsing_header(label="Live detection", default_open=True):
-                    dpg.add_checkbox(label="Enabled", tag="detect_cb",
-                                     callback=lambda s, v: S.__setitem__("detect", v))
-                    dpg.add_checkbox(label="Draw boxes", tag="boxes", default_value=True)
-                    dpg.add_slider_float(label="Every s", tag="interval", default_value=1.0,
-                                         min_value=0.1, max_value=5.0, width=120)
-                    dpg.add_text("idle", tag="pred_top")
-                    dpg.add_progress_bar(tag="pred_bar", default_value=0.0, width=-1)
-                    dpg.add_text("", tag="pred_list")
-                    with dpg.tree_node(label="Raw response"):
-                        dpg.add_text("", tag="pred_raw", wrap=290)
-
-                with dpg.collapsing_header(label="Jetson API"):
-                    dpg.add_input_text(label="URL", tag="url",
-                                       default_value=JETSON_URL, width=180)
-                    dpg.add_input_text(label="Field", tag="field",
-                                       default_value="file", width=100)
-                    dpg.add_input_float(label="Timeout s", tag="timeout", default_value=4.0,
-                                        min_value=0.5, max_value=30.0, step=0.5, width=100)
-                    dpg.add_button(label="Test connection", width=-1, height=30,
-                                   callback=lambda: threading.Thread(target=test_api,
-                                                                     daemon=True).start())
-                    dpg.add_text("", tag="api_status", wrap=290)
-
-                with dpg.collapsing_header(label="Display"):
-                    dpg.add_slider_float(label="Gamma", default_value=GAMMA, min_value=0.4,
-                                         max_value=3.0, width=120,
-                                         callback=lambda s, v: set_gamma(g=v))
-                    dpg.add_slider_float(label="UI scale", default_value=1.0, min_value=0.7,
-                                         max_value=2.0, width=120, callback=set_scale)
-                    dpg.add_button(label="Light / dark", callback=toggle_theme, width=-1)
-                    dpg.add_checkbox(label="Legacy colour on save", tag="legacy_color",
-                                     default_value=True)
 
     if S["fonts"]:
-        dpg.bind_item_font("hud", S["fonts"][34])
-        dpg.bind_item_font("pred_top", S["fonts"][22])
+        dpg.bind_item_font("hud", S["fonts"][32])
+        dpg.bind_item_font("pred_label", S["fonts"][21])
 
     with dpg.handler_registry():
         dpg.add_key_press_handler(dpg.mvKey_Q, callback=capture)
@@ -321,41 +402,42 @@ def build_ui(tex):
     dpg.set_viewport_resize_callback(fit_image)
 
 
-def test_api():
-    if S["preview"] is None:
-        log("no frame yet")
-        return
-    S["pred"] = send_once(S["preview"])
-    log("API test: " + json.dumps(S["pred"])[:80])
-
-
 def draw_panel(preview):
     p = S["pred"]
     if p is None:
         return
-    if isinstance(p, dict) and "error" in p:
-        dpg.set_value("pred_top", "API ERROR")
-        dpg.set_value("pred_bar", 0.0)
-        dpg.set_value("pred_list", p["error"][:160])
-        dpg.set_value("api_status", p["error"][:160])
-        return
-
-    dets = sorted(_preds(p), key=_conf, reverse=True)
-    dpg.set_value("pred_top", f"{_label(dets[0])}  {_conf(dets[0]) * 100:.0f}%"
-                  if dets else "no detections")
-    dpg.set_value("pred_bar", min(1.0, _conf(dets[0])) if dets else 0.0)
-    dpg.set_value("pred_list", "\n".join(f"{_label(d):<18}{_conf(d) * 100:5.1f}%"
-                                         for d in dets[:6]) + f"\n\n{S['ms']} ms")
-    dpg.set_value("pred_raw", json.dumps(p)[:1500])
-    dpg.set_value("api_status", "OK")
-
     if dpg.get_value("boxes"):
-        for d in dets[:20]:
+        for d in (p.get("detections") or [])[:20]:
             b = _box(d) if isinstance(d, dict) else None
             if b:
                 cv2.rectangle(preview, b[:2], b[2:], (255, 255, 255), 2)
                 cv2.putText(preview, f"{_label(d)} {_conf(d):.2f}", (b[0], max(12, b[1] - 6)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+    if p is S["drawn"]:      # widgets only change when a new response lands
+        return
+    S["drawn"] = p
+    if isinstance(p, dict) and "error" in p:
+        dpg.set_value("pred_label", "ERROR")
+        dpg.set_value("pred_meta", p["error"][:200])
+        for i in range(ROWS):
+            dpg.hide_item(f"bar{i}")
+        return
+
+    ranked = _ranked(p)
+    dpg.set_value("pred_label", f"{ranked[0][0]}   {ranked[0][1] * 100:.1f}%"
+                  if ranked else "no prediction")
+    dpg.set_value("pred_meta",
+                  f"{p.get('model_id', '?')}:{p.get('model_version', '?')}   "
+                  f"{p.get('latency_ms', 0):.0f} ms"
+                  + (f"   margin {p['margin']:.3f}" if p.get("margin") is not None else ""))
+    for i in range(ROWS):
+        if i < len(ranked):
+            dpg.configure_item(f"bar{i}", show=True,
+                               overlay=f"{ranked[i][0]}   {ranked[i][1] * 100:.1f}%")
+            dpg.set_value(f"bar{i}", min(1.0, ranked[i][1]))
+        else:
+            dpg.hide_item(f"bar{i}")
+    dpg.set_value("pred_raw", json.dumps(p)[:2000])
 
 
 def main():
@@ -401,7 +483,7 @@ def main():
                 if f is not None:
                     S["frame"] = f
                     prev = cv2.resize(f, (S["pw"], S["ph"]))
-                    S["preview"] = prev                     # BGR, what the Jetson wants
+                    S["preview"] = prev                     # BGR, what the server wants
                     shown = cv2.LUT(prev, S["lut"])
                     draw_panel(shown)
                     tex[:] = shown[..., ::-1].ravel() * np.float32(1 / 255)   # BGR -> texture RGB
@@ -430,26 +512,27 @@ def main():
 
 
 def selftest():
-    body, ct = _multipart(b"\xff\xd8jpg", "image")
-    assert b'name="image"' in body and body.endswith(b"--\r\n") and ct.startswith("multipart/")
-    assert ct.split("boundary=")[1].encode() in body
-    assert _preds({"predictions": [{"class": "knot", "confidence": .9}]})[0]["class"] == "knot"
-    assert _preds({"detections": [1, 2]}) == [1, 2]
-    assert _preds({"class": "2A", "score": .5}) == [{"class": "2A", "score": .5}]
-    assert _preds({"nope": 1}) == [] and _preds([{"a": 1}]) == [{"a": 1}]
-    assert _conf({"score": .5}) == .5 and _label({"name": "x"}) == "x"
+    body, ct = _multipart([("task", "classification"), ("tta", "false")],
+                          [("images", "a.jpg", b"\xff\xd8A"), ("images", "b.jpg", b"\xff\xd8B")])
+    assert ct.split("boundary=")[1].encode() in body and body.endswith(b"--\r\n")
+    assert body.count(b'name="images"') == 2 and b'name="task"\r\n\r\nclassification' in body
+    # the server's own envelope
+    env = {"label": "gradeA", "confidence": .44, "margin": .06,
+           "probs": {"gradeA": .44, "gradeB": .19, "gradeC": .37}, "latency_ms": 944.1}
+    assert _ranked(env) == [("gradeA", .44), ("gradeC", .37), ("gradeB", .19)]
+    assert _ranked({"label": "x", "confidence": .5}) == [("x", .5)]
+    assert _ranked({"detections": [{"class": "knot", "score": .8}]}) == [("knot", .8)]
+    assert _ranked({"nope": 1}) == []
     assert _box({"x": 10, "y": 10, "width": 4, "height": 6}) == (8, 7, 12, 13)
     assert _box({"bbox": [1, 2, 3, 4]}) == (1, 2, 4, 6)
     assert _box({"x1": 1, "y1": 2, "x2": 3, "y2": 4}) == (1, 2, 3, 4)
     assert _box({}) is None
     set_gamma(g=1.0)
-    assert S["lut"][0] == 0 and S["lut"][255] == 255 and S["lut"][128] == 128  # 1.0 = passthrough
+    assert S["lut"][0] == 0 and S["lut"][255] == 255 and S["lut"][128] == 128  # passthrough
     set_gamma(g=2.2)
     assert S["lut"][128] < 128 and S["lut"][255] == 255                        # darkens midtones
-    # grab() returns BGR: a scene-red pixel must land in channel 2, and the texture
-    # upload must swap it back to channel 0 so faces are not blue.
-    red_bgr = np.array([[[0, 0, 255]]], np.uint8)
-    assert list(red_bgr[..., ::-1].ravel()) == [255, 0, 0]
+    # grab() gives BGR; the texture upload must swap it or faces go blue
+    assert list(np.array([[[0, 0, 255]]], np.uint8)[..., ::-1].ravel()) == [255, 0, 0]
     print("selftest ok")
 
 
