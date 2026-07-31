@@ -1,6 +1,7 @@
 import PySpin
 import cv2
 import os
+import ctypes
 import time
 import json
 import uuid
@@ -48,8 +49,9 @@ S = {
     "run": True, "frame": None, "preview": None,
     "id": 0, "img": 1, "last_id": -1, "session": False, "saved": 0,
     "detect": False, "pred": None, "drawn": None, "log": [], "dark": True,
-    "lut": None, "pw": PREVIEW_W, "ph": 0, "panel": PANEL_W,
-    "fonts": {}, "roles": {}, "bars": {},
+    "lut": None, "pw": PREVIEW_W, "ph": 0, "panel": PANEL_W, "src_w": 1920,
+    "aspect": 0.75, "tex": None, "tex_tag": "texA", "idle": None, "idle_sub": "",
+    "fonts": {}, "roles": {}, "bars": {}, "btn": {},
 }
 SAVE_Q = queue.Queue()   # capture never blocks the live feed
 
@@ -338,9 +340,12 @@ def set_detect(_=None, on=False):
     boards against the server or shooting a dataset, never both at once."""
     S["detect"] = on
     dpg.configure_item("cap_btn", enabled=not on,
-                       label="CAPTURE      Q" if not on else "CAPTURE  -  off in Live AI")
+                       label="CAPTURE      Q" if not on else "CAPTURE LOCKED")
+    dpg.bind_item_theme("cap_btn", S["btn"][RED] if on else 0)
+    dpg.configure_item("ai_btn", label="LIVE AI   ON" if on else "LIVE AI   OFF")
+    dpg.bind_item_theme("ai_btn", S["btn"][GREEN] if on else 0)
     dpg.configure_item("raw_node", show=on)   # the server's own words, while predicting
-    log("Live AI on - capture disabled" if on else "Live AI off - capture enabled")
+    log("Live AI on - capture locked" if on else "Live AI off - capture ready")
 
 
 def capture():
@@ -379,20 +384,39 @@ def draw_hud(img):
     """The operator's instruction goes ON the video, drawn by OpenCV: crisp at any
     size and independent of the GUI font."""
     scale = img.shape[1] / 900          # HUD keeps its proportions at any preview size
+    light = LIGHTS[S["img"]].replace("_", " ").upper()
     if S["detect"]:
-        top, bottom = "LIVE AI", "CAPTURE DISABLED WHILE PREDICTING"
+        top, bottom = "LIVE AI RUNNING", "CAPTURE IS LOCKED  -  TURN LIVE AI OFF TO SHOOT"
     elif S["session"]:
-        top = f"ID {S['id']}      SHOT {S['img']} OF 3"
-        bottom = "SET LIGHTS:  " + LIGHTS[S["img"]].replace("_", " ").upper()
+        top = f"BOARD {S['id']}      SHOT {S['img']} OF 3"
+        bottom = f"SET LIGHTS TO {light},  THEN PRESS  Q"
     else:
         top = "READY"
-        bottom = f"PRESS  Q  TO START AT ID {dpg.get_value('start_id')}"
+        bottom = (f"PRESS  Q  TO SHOOT BOARD {dpg.get_value('start_id')}  -  "
+                  f"SHOT 1 OF 3, LIGHTS {light}")
     band = img[:int(86 * scale)]
     band[:] = cv2.addWeighted(band, 0.25, np.zeros_like(band), 0, 0)   # legible on any board
     cv2.putText(img, top, (int(18 * scale), int(36 * scale)), FONT, 1.0 * scale,
                 (255, 255, 255), max(1, int(2 * scale)), cv2.LINE_AA)
     cv2.putText(img, bottom, (int(18 * scale), int(71 * scale)), FONT, 0.75 * scale,
                 (150, 235, 170), max(1, int(2 * scale)), cv2.LINE_AA)
+
+
+def draw_pred_overlay(img):
+    """While Live AI runs the grade belongs on the video, big and sharp, not in
+    13px panel text."""
+    if not S["detect"] or not isinstance(S["pred"], dict) or "error" in S["pred"]:
+        return
+    ranked = _ranked(S["pred"])
+    if not ranked:
+        return
+    label, c = ranked[0]
+    scale = img.shape[1] / 900
+    band = img[img.shape[0] - int(72 * scale):]
+    band[:] = cv2.addWeighted(band, 0.25, np.zeros_like(band), 0, 0)
+    cv2.putText(img, f"{label}   {c * 100:.0f}%",
+                (int(18 * scale), img.shape[0] - int(24 * scale)), FONT, 1.3 * scale,
+                conf_color(c)[::-1], max(1, int(3 * scale)), cv2.LINE_AA)
 
 
 def placeholder(msg, sub):
@@ -404,9 +428,21 @@ def placeholder(msg, sub):
 
 
 # ------------------------------------------------------------------ fonts
+def dpi_aware():
+    """Without this Windows bitmap-stretches the whole window on a scaled display
+    and every pixel goes soft - the usual reason DPG text looks wonky."""
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)     # per-monitor aware
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()      # older Windows
+        except Exception:
+            pass
+
+
 def build_fonts():
-    """One crisp raster per (family, preset, role). Cheap enough to do all of them
-    up front, and switching is then just a rebind."""
+    """One crisp raster per (family, preset, role) - never a scaled bitmap.
+    pixel_snapH aligns glyphs to whole pixels, which is what kills the fuzz."""
     have = {n: p for n, p in FAMILIES.items() if os.path.exists(p)}
     if not have:
         return ["Default"]
@@ -414,7 +450,8 @@ def build_fonts():
         for name, path in have.items():
             for preset, mult in TEXT_SIZES.items():
                 for role, pt in ROLE_PT.items():
-                    S["fonts"][(name, preset, role)] = dpg.add_font(path, int(pt * mult))
+                    S["fonts"][(name, preset, role)] = dpg.add_font(
+                        path, int(pt * mult), pixel_snapH=True)
     return ["Default"] + list(have)
 
 
@@ -489,12 +526,36 @@ def toggle_theme():
     dpg.bind_theme(S["dark_theme"] if S["dark"] else S["light_theme"])
 
 
+def ensure_tex(want_w):
+    """Re-cut the texture to roughly the size it is being displayed at.
+
+    A fixed 900px texture stretched across a maximised window is just blur, and
+    a big texture on a small window is wasted CPU every frame. Reallocating on a
+    real size change costs nothing while nobody is dragging the window edge.
+    Double-buffered tags so the image never points at a deleted texture."""
+    want_w = int(max(320, min(want_w, S["src_w"], 1920)))
+    if abs(want_w - S["pw"]) < 64:
+        return
+    h = max(1, int(want_w * S["aspect"]))
+    S["pw"], S["ph"] = want_w, h
+    S["tex"] = np.zeros(want_w * h * 3, dtype=np.float32)
+    old, new = S["tex_tag"], ("texB" if S["tex_tag"] == "texA" else "texA")
+    dpg.add_raw_texture(want_w, h, S["tex"], format=dpg.mvFormat_Float_rgb,
+                        tag=new, parent="texreg")
+    dpg.configure_item("img", texture_tag=new)
+    dpg.delete_item(old)
+    S["tex_tag"] = new
+    S["idle"] = placeholder("NO CAMERA DETECTED", S["idle_sub"])
+
+
 def fit_image(*_):
     """Scale the preview to whatever room the window currently has."""
     w = dpg.get_viewport_client_width() - S["panel"] - 70
     h = dpg.get_viewport_client_height() - 130       # tab bar + last-event line
-    s = max(0.15, min(w / S["pw"], h / S["ph"]))
-    dpg.configure_item("img", width=int(S["pw"] * s), height=int(S["ph"] * s))
+    show_w = int(min(w, h / S["aspect"]))            # fit, preserving aspect
+    ensure_tex(show_w)
+    dpg.configure_item("img", width=max(160, show_w),
+                       height=max(120, int(show_w * S["aspect"])))
 
 
 # ------------------------------------------------------------------ ui
@@ -509,11 +570,23 @@ def note(text):
     return role(dpg.add_text(text, color=DIM_C, wrap=560), "small")
 
 
-def build_ui(tex, families):
-    with dpg.texture_registry():
-        dpg.add_raw_texture(S["pw"], S["ph"], tex, format=dpg.mvFormat_Float_rgb, tag="tex")
+def btn_theme(rgb):
+    with dpg.theme() as t:
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_color(dpg.mvThemeCol_Button, rgb, category=dpg.mvThemeCat_Core)
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, rgb, category=dpg.mvThemeCat_Core)
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, rgb, category=dpg.mvThemeCat_Core)
+            dpg.add_theme_color(dpg.mvThemeCol_Text, (20, 20, 22), category=dpg.mvThemeCat_Core)
+    return t
+
+
+def build_ui(families):
+    with dpg.texture_registry(tag="texreg"):
+        dpg.add_raw_texture(S["pw"], S["ph"], S["tex"], format=dpg.mvFormat_Float_rgb,
+                            tag=S["tex_tag"])
 
     S["bars"] = {c: bar_theme(c) for c in (GREEN, AMBER, RED, (95, 95, 100))}
+    S["btn"] = {c: btn_theme(c) for c in (GREEN, RED)}
 
     with dpg.window(tag="root"):
         with dpg.tab_bar():
@@ -521,11 +594,14 @@ def build_ui(tex, families):
             # ============================================== the working screen
             with dpg.tab(label="   Capture   "):
                 with dpg.group(horizontal=True):
-                    dpg.add_image("tex", tag="img")
+                    dpg.add_image(S["tex_tag"], tag="img")
 
                     with dpg.child_window(width=S["panel"], autosize_y=True, tag="side"):
                         dpg.add_button(label="CAPTURE      Q", callback=capture,
                                        width=-1, height=66, tag="cap_btn")
+                        dpg.add_button(label="LIVE AI   OFF", width=-1, height=38,
+                                       tag="ai_btn",
+                                       callback=lambda: set_detect(on=not S["detect"]))
                         with dpg.group(horizontal=True):
                             role(dpg.add_text("0", tag="c_saved", color=GREEN), "head")
                             note("saved")
@@ -533,9 +609,9 @@ def build_ui(tex, families):
                             note("queued")
                         dpg.add_spacer(height=6)
 
-                        section("Next")
-                        role(dpg.add_text("", tag="next_light", wrap=260), "head")
-                        note("press Q, then set this lighting for the following shot")
+                        section("Do this now")
+                        role(dpg.add_text("", tag="now_light", wrap=260, color=GREEN), "head")
+                        role(dpg.add_text("", tag="now_step", wrap=260, color=DIM_C), "small")
                         dpg.add_spacer(height=6)
 
                         section("Picture")
@@ -603,7 +679,7 @@ def build_ui(tex, families):
                         section("Appearance")
                         with dpg.group(horizontal=True):
                             dpg.add_combo(families, label="Font", tag="font_family",
-                                          default_value=families[min(1, len(families) - 1)],
+                                          default_value="Default",
                                           width=150, callback=apply_look)
                             dpg.add_spacer(width=16)
                             dpg.add_combo(list(TEXT_SIZES), label="Size", tag="text_size",
@@ -611,6 +687,9 @@ def build_ui(tex, families):
                                           callback=apply_look)
                         dpg.add_button(label="Light / dark", callback=toggle_theme,
                                        width=-1, height=34)
+                        note("Default is DearPyGui's built-in bitmap font - always "
+                             "sharp, one size. The TTF families give the size presets "
+                             "but need a scaled display to look right.")
 
                     # ---------------------------------- right: the Jetson
                     with dpg.child_window(width=-1, autosize_y=True):
@@ -731,7 +810,7 @@ def main():
     cam = None
     if cam_list.GetSize() == 0:
         print("No FLIR cameras detected - GUI runs in offline mode.")
-        S["ph"] = int(PREVIEW_W * 0.75)
+        S["ph"], S["src_w"] = int(PREVIEW_W * 0.75), 1920
     else:
         cam = cam_list.GetByIndex(0)
         cam.Init()
@@ -743,17 +822,22 @@ def main():
         except PySpin.SpinnakerException as ex:
             print("Could not set full resolution:", ex)
         w, h = int(cam.Width.GetValue() / ZOOM), int(cam.Height.GetValue() / ZOOM)
-        S["ph"] = int(PREVIEW_W * h / w)
+        S["ph"], S["src_w"] = int(PREVIEW_W * h / w), w    # never upscale past the sensor
         cam.BeginAcquisition()
 
+    S["aspect"] = S["ph"] / S["pw"]
+    S["idle_sub"] = ("Offline mode - the UI works, capture does not."
+                     if cam is None else "waiting for the first frame...")
+    S["idle"] = placeholder("NO CAMERA DETECTED", S["idle_sub"])
+    S["tex"] = np.zeros(S["pw"] * S["ph"] * 3, dtype=np.float32)
     set_gamma()
-    tex = np.zeros(S["pw"] * S["ph"] * 3, dtype=np.float32)
 
+    dpi_aware()
     dpg.create_context()
     dpg.create_viewport(title="Gibson Capture", width=1360, height=860,
                         min_width=760, min_height=560)
     families = build_fonts()
-    build_ui(tex, families)
+    build_ui(families)
     dpg.setup_dearpygui()
     load_conf()
     apply_look()
@@ -764,29 +848,38 @@ def main():
         threading.Thread(target=fn, daemon=True).start()
     log("Ready. Press Q to capture.")
 
-    idle = placeholder("NO CAMERA DETECTED",
-                       "Offline mode - the UI works, capture does not."
-                       if cam is None else "waiting for the first frame...")
     try:
         while dpg.is_dearpygui_running():
+            # One snapshot per iteration: a resize swaps S["tex"] for a different
+            # shape, and this pairing keeps the buffer and its dimensions together.
+            tex, pw, ph = S["tex"], S["pw"], S["ph"]
             f = grab(cam) if cam is not None else None
             if f is not None:
                 S["frame"] = f
-                prev = cv2.resize(f, (S["pw"], S["ph"]))
+                prev = cv2.resize(f, (pw, ph))
                 S["preview"] = prev                         # BGR, what the server wants
                 shown = cv2.LUT(prev, S["lut"])
             elif S["frame"] is None:
-                shown = idle.copy()                         # never an unexplained black box
+                shown = cv2.resize(S["idle"], (pw, ph))     # never an unexplained black box
             else:
                 shown = None                                # dropped frame, keep the last one
             if shown is not None:
                 draw_boxes(shown)
+                draw_pred_overlay(shown)
                 draw_hud(shown)
                 tex[:] = shown[..., ::-1].ravel() * np.float32(1 / 255)   # BGR -> texture RGB
 
             show_pred()
-            dpg.set_value("next_light", LIGHTS[S["img"]].replace("_", " ")
-                          if S["session"] else "press Q to begin")
+            light = LIGHTS[S["img"]].replace("_", " ")
+            if S["detect"]:
+                dpg.set_value("now_light", "Live AI is running")
+                dpg.set_value("now_step", "capture is locked until you switch it off")
+            else:
+                dpg.set_value("now_light", f"Set lights to {light}")
+                dpg.set_value("now_step",
+                              f"then press Q for shot {S['img']} of 3, board {S['id']}"
+                              if S["session"] else
+                              f"then press Q to start board {dpg.get_value('start_id')}")
             dpg.set_value("c_saved", str(S["saved"]))
             n = SAVE_Q.qsize()
             dpg.set_value("c_queue", str(n))
