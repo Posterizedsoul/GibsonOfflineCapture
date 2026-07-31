@@ -16,9 +16,9 @@ import dearpygui.dearpygui as dpg
 SAVE_ROOT = r"C:\Gibson"
 JETSON_URL = "http://jetson.local:8000/predict"
 ZOOM = 1.13              # calibration knob: lens/sensor crop, tune per rig
-GAMMA = 2.2              # calibration knob: display only, 1.0 = raw passthrough
+GAMMA = 1.0              # calibration knob: display only, 1.0 = raw passthrough
 PREVIEW_W = 760          # texture width, keep small - these are old machines
-PANEL_W = 340
+PANEL_W = 330
 FONTS = (r"C:\Windows\Fonts\segoeui.ttf", r"C:\Windows\Fonts\arial.ttf")
 LIGHTS = {1: "Ring_and_Small_Lights", 2: "Only_Ring_Light", 3: "Only_Small_Lights"}
 
@@ -26,7 +26,7 @@ S = {
     "run": True, "frame": None, "preview": None,
     "id": 0, "img": 1, "last_id": -1, "session": False,
     "detect": False, "pred": None, "ms": 0, "log": [], "dark": True,
-    "lut": None, "pw": PREVIEW_W, "ph": 0,
+    "lut": None, "pw": PREVIEW_W, "ph": 0, "fonts": {},
 }
 SAVE_Q = queue.Queue()   # capture never blocks the live feed
 
@@ -86,10 +86,10 @@ def _box(d):
     return None
 
 
-def send_once(frame_rgb):
+def send_once(frame_bgr):
     """One round trip. Returns the parsed response or an {'error': ...} dict."""
     try:
-        return post_frame(dpg.get_value("url"), cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR),
+        return post_frame(dpg.get_value("url"), frame_bgr,
                           dpg.get_value("field"), dpg.get_value("timeout"))
     except Exception as ex:
         return {"error": f"{type(ex).__name__}: {ex}"}
@@ -113,12 +113,12 @@ def save_loop():
     """Disk writes happen here so the live feed never stalls on a capture."""
     while S["run"]:
         try:
-            path, rgb = SAVE_Q.get(timeout=0.3)
+            path, bgr = SAVE_Q.get(timeout=0.3)
         except queue.Empty:
             continue
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            cv2.imwrite(path, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+            cv2.imwrite(path, bgr)
             log(f"saved {os.path.basename(path)}")
         except Exception as ex:
             log(f"SAVE FAILED: {ex}")
@@ -128,6 +128,8 @@ def save_loop():
 
 # ------------------------------------------------------------------ camera
 def grab(cam):
+    """Returns a BGR frame. cv2.COLOR_BayerRG2RGB is an alias of BayerBG2BGR, so
+    the result is BGR-ordered - that is why the old cv2.imshow preview looked right."""
     try:
         img = cam.GetNextImage(1000)
     except PySpin.SpinnakerException:
@@ -136,16 +138,16 @@ def grab(cam):
         img.Release()
         return None
     bayer = np.frombuffer(img.GetData(), dtype=np.uint8).reshape(img.GetHeight(), img.GetWidth())
-    rgb = cv2.cvtColor(bayer, cv2.COLOR_BayerRG2RGB)  # copies, safe to Release after
+    bgr = cv2.cvtColor(bayer, cv2.COLOR_BayerRG2RGB)  # copies, safe to Release after
     img.Release()
-    h, w = rgb.shape[:2]
+    h, w = bgr.shape[:2]
     nw, nh = int(w / ZOOM), int(h / ZOOM)
-    return rgb[(h - nh) // 2:(h - nh) // 2 + nh, (w - nw) // 2:(w - nw) // 2 + nw]
+    return bgr[(h - nh) // 2:(h - nh) // 2 + nh, (w - nw) // 2:(w - nw) // 2 + nw]
 
 
 # ------------------------------------------------------------------ session
 def log(msg):
-    S["log"] = (S["log"] + [f"{time.strftime('%H:%M:%S')}  {msg}"])[-14:]
+    S["log"] = (S["log"] + [f"{time.strftime('%H:%M:%S')}  {msg}"])[-40:]
     dpg.set_value("log", "\n".join(S["log"]))
 
 
@@ -163,7 +165,10 @@ def capture():
         return
     folder = os.path.join(SAVE_ROOT, dpg.get_value("vendor"), dpg.get_value("grade"), str(S["id"]))
     name = f"{time.strftime('%H-%M-%S')}_{S['img']}_{LIGHTS[S['img']]}.jpg"
-    SAVE_Q.put((os.path.join(folder, name), S["frame"]))
+    # 'Legacy colour' reproduces the original script's RGB2BGR swap before imwrite,
+    # which stores R and B swapped. Off = the file matches what you see on screen.
+    frame = S["frame"][..., ::-1] if dpg.get_value("legacy_color") else S["frame"]
+    SAVE_Q.put((os.path.join(folder, name), frame))
     log(f"queued {S['id']}/{name}")
 
     S["img"] += 1
@@ -180,37 +185,35 @@ def capture():
 
 # ------------------------------------------------------------------ look
 def set_gamma(_=None, g=None):
-    g = GAMMA if g is None else g
-    S["lut"] = (np.linspace(0, 1, 256) ** g * 255).astype(np.uint8)
+    S["lut"] = (np.linspace(0, 1, 256) ** (GAMMA if g is None else g) * 255).astype(np.uint8)
 
 
 def make_theme(dark):
     bg, child, frame, btn, hov, act, txt, dim = (
-        ((18, 18, 18), (30, 30, 30), (48, 48, 48), (64, 64, 64), (96, 96, 96),
-         (128, 128, 128), (245, 245, 245), (150, 150, 150))
+        ((20, 20, 22), (32, 32, 35), (50, 50, 54), (66, 66, 70), (98, 98, 104),
+         (130, 130, 136), (245, 245, 245), (145, 145, 150))
         if dark else
-        ((242, 242, 242), (255, 255, 255), (226, 226, 226), (216, 216, 216), (196, 196, 196),
-         (168, 168, 168), (16, 16, 16), (110, 110, 110)))
+        ((240, 240, 242), (255, 255, 255), (228, 228, 231), (218, 218, 222), (198, 198, 202),
+         (170, 170, 175), (18, 18, 20), (110, 110, 115)))
     with dpg.theme() as t:
         with dpg.theme_component(dpg.mvAll):
             for k, v in ((dpg.mvStyleVar_FrameRounding, 5), (dpg.mvStyleVar_ChildRounding, 7),
                          (dpg.mvStyleVar_WindowRounding, 7), (dpg.mvStyleVar_GrabRounding, 5),
-                         (dpg.mvStyleVar_FrameBorderSize, 1)):
+                         (dpg.mvStyleVar_FrameBorderSize, 1), (dpg.mvStyleVar_WindowPadding, 10)):
                 dpg.add_theme_style(k, v, category=dpg.mvThemeCat_Core)
             dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 9, 6, category=dpg.mvThemeCat_Core)
             dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 8, 7, category=dpg.mvThemeCat_Core)
             for k, v in ((dpg.mvThemeCol_WindowBg, bg), (dpg.mvThemeCol_ChildBg, child),
-                         (dpg.mvThemeCol_PopupBg, child), (dpg.mvThemeCol_MenuBarBg, child),
-                         (dpg.mvThemeCol_FrameBg, frame), (dpg.mvThemeCol_FrameBgHovered, hov),
-                         (dpg.mvThemeCol_FrameBgActive, act), (dpg.mvThemeCol_Button, btn),
-                         (dpg.mvThemeCol_ButtonHovered, hov), (dpg.mvThemeCol_ButtonActive, act),
-                         (dpg.mvThemeCol_Header, btn), (dpg.mvThemeCol_HeaderHovered, hov),
-                         (dpg.mvThemeCol_HeaderActive, act), (dpg.mvThemeCol_Border, frame),
-                         (dpg.mvThemeCol_Text, txt), (dpg.mvThemeCol_TextDisabled, dim),
-                         (dpg.mvThemeCol_TitleBg, child), (dpg.mvThemeCol_TitleBgActive, frame),
-                         (dpg.mvThemeCol_SliderGrab, txt), (dpg.mvThemeCol_SliderGrabActive, txt),
-                         (dpg.mvThemeCol_CheckMark, txt), (dpg.mvThemeCol_PlotHistogram, txt),
-                         (dpg.mvThemeCol_ScrollbarBg, child), (dpg.mvThemeCol_ScrollbarGrab, frame)):
+                         (dpg.mvThemeCol_PopupBg, child), (dpg.mvThemeCol_FrameBg, frame),
+                         (dpg.mvThemeCol_FrameBgHovered, hov), (dpg.mvThemeCol_FrameBgActive, act),
+                         (dpg.mvThemeCol_Button, btn), (dpg.mvThemeCol_ButtonHovered, hov),
+                         (dpg.mvThemeCol_ButtonActive, act), (dpg.mvThemeCol_Header, frame),
+                         (dpg.mvThemeCol_HeaderHovered, hov), (dpg.mvThemeCol_HeaderActive, act),
+                         (dpg.mvThemeCol_Border, frame), (dpg.mvThemeCol_Text, txt),
+                         (dpg.mvThemeCol_TextDisabled, dim), (dpg.mvThemeCol_SliderGrab, txt),
+                         (dpg.mvThemeCol_SliderGrabActive, txt), (dpg.mvThemeCol_CheckMark, txt),
+                         (dpg.mvThemeCol_PlotHistogram, txt), (dpg.mvThemeCol_ScrollbarBg, child),
+                         (dpg.mvThemeCol_ScrollbarGrab, frame), (dpg.mvThemeCol_Separator, frame)):
                 dpg.add_theme_color(k, v, category=dpg.mvThemeCat_Core)
     return t
 
@@ -223,7 +226,7 @@ def toggle_theme():
 def fit_image(*_):
     """Scale the preview to whatever room the window currently has."""
     w = dpg.get_viewport_client_width() - PANEL_W - 46
-    h = dpg.get_viewport_client_height() - 190
+    h = dpg.get_viewport_client_height() - 235          # status line + log strip
     s = max(0.15, min(w / S["pw"], h / S["ph"]))
     dpg.configure_item("img", width=int(S["pw"] * s), height=int(S["ph"] * s))
 
@@ -238,70 +241,76 @@ def build_ui(tex):
     for p in FONTS:
         if os.path.exists(p):
             with dpg.font_registry():
-                dpg.bind_font(dpg.add_font(p, 18))
+                S["fonts"] = {n: dpg.add_font(p, n) for n in (17, 22, 34)}
+            dpg.bind_font(S["fonts"][17])
             break
 
-    with dpg.texture_registry(tag="tr"):
+    with dpg.texture_registry():
         dpg.add_raw_texture(S["pw"], S["ph"], tex, format=dpg.mvFormat_Float_rgb, tag="tex")
 
-    # --- API settings: its own window, opened from the menu
-    with dpg.window(label="API Settings", tag="api_win", show=False, pos=(120, 120),
-                    width=430, height=210, no_collapse=True):
-        dpg.add_text("Jetson endpoint")
-        dpg.add_input_text(tag="url", default_value=JETSON_URL, width=-1)
-        dpg.add_input_text(label="Form field", tag="field", default_value="file", width=140)
-        dpg.add_input_float(label="Timeout s", tag="timeout", default_value=4.0,
-                            min_value=0.5, max_value=30.0, step=0.5, width=140)
-        dpg.add_button(label="Test connection", width=-1, height=32, callback=lambda: threading.Thread(
-            target=lambda: S.__setitem__("pred", send_once(S["preview"]))
-            if S["preview"] is not None else log("no frame yet"), daemon=True).start())
-        dpg.add_text("", tag="api_status", wrap=400)
-
-    # --- live detection: its own window too, so it can sit on a second screen
-    with dpg.window(label="Live Detection", tag="det_win", pos=(160, 380),
-                    width=430, height=330, no_collapse=True):
-        dpg.add_checkbox(label="Run live detection", tag="detect_cb",
-                         callback=lambda s, v: S.__setitem__("detect", v))
-        dpg.add_slider_float(label="Interval s", tag="interval", default_value=1.0,
-                             min_value=0.1, max_value=5.0, width=150)
-        dpg.add_checkbox(label="Draw boxes on feed", tag="boxes", default_value=True)
-        dpg.add_separator()
-        dpg.add_text("idle", tag="pred_top")
-        dpg.add_progress_bar(tag="pred_bar", default_value=0.0, width=-1)
-        dpg.add_text("", tag="pred_meta")
-        with dpg.collapsing_header(label="Raw response"):
-            dpg.add_text("", tag="pred_raw", wrap=400)
-
     with dpg.window(tag="root"):
-        with dpg.menu_bar():
-            with dpg.menu(label="Windows"):
-                dpg.add_menu_item(label="API Settings", callback=lambda: dpg.show_item("api_win"))
-                dpg.add_menu_item(label="Live Detection", callback=lambda: dpg.show_item("det_win"))
-            with dpg.menu(label="View"):
-                dpg.add_menu_item(label="Light / dark", callback=toggle_theme)
-                dpg.add_slider_float(label="UI scale", default_value=1.0, min_value=0.7,
-                                     max_value=2.0, width=140, callback=set_scale)
-                dpg.add_slider_float(label="Gamma", default_value=GAMMA, min_value=1.0,
-                                     max_value=3.0, width=140,
-                                     callback=lambda s, v: set_gamma(g=v))
-
         with dpg.group(horizontal=True):
-            with dpg.child_window(width=-(PANEL_W + 8), autosize_y=True):
+            # ---------------- live feed -------------------------------------
+            with dpg.child_window(width=-(PANEL_W + 8), autosize_y=True, border=False):
                 dpg.add_image("tex", tag="img")
-                dpg.add_text("", tag="hud")
-                dpg.add_text("", tag="log")
+                dpg.add_text("No active session", tag="hud")
+                with dpg.child_window(height=120):
+                    dpg.add_text("", tag="log")
 
+            # ---------------- controls --------------------------------------
             with dpg.child_window(width=PANEL_W, autosize_y=True):
-                dpg.add_text("SESSION")
-                dpg.add_input_text(label="Vendor", tag="vendor",
-                                   default_value="Electric_Hardwood", width=150)
-                dpg.add_input_text(label="Grade", tag="grade", default_value="2A", width=150)
-                dpg.add_input_int(label="Start ID", tag="start_id", default_value=147, width=150)
-                dpg.add_input_int(label="Total IDs", tag="total", default_value=5000, width=150)
-                dpg.add_button(label="Start session", callback=start_session, width=-1, height=34)
+                dpg.add_button(label="CAPTURE   (Q)", callback=capture, width=-1, height=58)
+                dpg.add_text("Queue: 0", tag="qstat")
                 dpg.add_separator()
-                dpg.add_button(label="CAPTURE  (Q)", callback=capture, width=-1, height=54)
-                dpg.add_text("", tag="qstat")
+
+                with dpg.collapsing_header(label="Session", default_open=True):
+                    dpg.add_input_text(label="Vendor", tag="vendor",
+                                       default_value="Electric_Hardwood", width=140)
+                    dpg.add_input_text(label="Grade", tag="grade", default_value="2A", width=140)
+                    dpg.add_input_int(label="Start ID", tag="start_id",
+                                      default_value=147, width=140)
+                    dpg.add_input_int(label="Total IDs", tag="total",
+                                      default_value=5000, width=140)
+                    dpg.add_button(label="Start session", callback=start_session,
+                                   width=-1, height=32)
+
+                with dpg.collapsing_header(label="Live detection", default_open=True):
+                    dpg.add_checkbox(label="Enabled", tag="detect_cb",
+                                     callback=lambda s, v: S.__setitem__("detect", v))
+                    dpg.add_checkbox(label="Draw boxes", tag="boxes", default_value=True)
+                    dpg.add_slider_float(label="Every s", tag="interval", default_value=1.0,
+                                         min_value=0.1, max_value=5.0, width=120)
+                    dpg.add_text("idle", tag="pred_top")
+                    dpg.add_progress_bar(tag="pred_bar", default_value=0.0, width=-1)
+                    dpg.add_text("", tag="pred_list")
+                    with dpg.tree_node(label="Raw response"):
+                        dpg.add_text("", tag="pred_raw", wrap=290)
+
+                with dpg.collapsing_header(label="Jetson API"):
+                    dpg.add_input_text(label="URL", tag="url",
+                                       default_value=JETSON_URL, width=180)
+                    dpg.add_input_text(label="Field", tag="field",
+                                       default_value="file", width=100)
+                    dpg.add_input_float(label="Timeout s", tag="timeout", default_value=4.0,
+                                        min_value=0.5, max_value=30.0, step=0.5, width=100)
+                    dpg.add_button(label="Test connection", width=-1, height=30,
+                                   callback=lambda: threading.Thread(target=test_api,
+                                                                     daemon=True).start())
+                    dpg.add_text("", tag="api_status", wrap=290)
+
+                with dpg.collapsing_header(label="Display"):
+                    dpg.add_slider_float(label="Gamma", default_value=GAMMA, min_value=0.4,
+                                         max_value=3.0, width=120,
+                                         callback=lambda s, v: set_gamma(g=v))
+                    dpg.add_slider_float(label="UI scale", default_value=1.0, min_value=0.7,
+                                         max_value=2.0, width=120, callback=set_scale)
+                    dpg.add_button(label="Light / dark", callback=toggle_theme, width=-1)
+                    dpg.add_checkbox(label="Legacy colour on save", tag="legacy_color",
+                                     default_value=True)
+
+    if S["fonts"]:
+        dpg.bind_item_font("hud", S["fonts"][34])
+        dpg.bind_item_font("pred_top", S["fonts"][22])
 
     with dpg.handler_registry():
         dpg.add_key_press_handler(dpg.mvKey_Q, callback=capture)
@@ -312,6 +321,14 @@ def build_ui(tex):
     dpg.set_viewport_resize_callback(fit_image)
 
 
+def test_api():
+    if S["preview"] is None:
+        log("no frame yet")
+        return
+    S["pred"] = send_once(S["preview"])
+    log("API test: " + json.dumps(S["pred"])[:80])
+
+
 def draw_panel(preview):
     p = S["pred"]
     if p is None:
@@ -319,15 +336,16 @@ def draw_panel(preview):
     if isinstance(p, dict) and "error" in p:
         dpg.set_value("pred_top", "API ERROR")
         dpg.set_value("pred_bar", 0.0)
-        dpg.set_value("pred_meta", p["error"][:160])
+        dpg.set_value("pred_list", p["error"][:160])
         dpg.set_value("api_status", p["error"][:160])
         return
 
     dets = sorted(_preds(p), key=_conf, reverse=True)
-    dpg.set_value("pred_top", f"{_label(dets[0])}   {_conf(dets[0]) * 100:.1f}%"
+    dpg.set_value("pred_top", f"{_label(dets[0])}  {_conf(dets[0]) * 100:.0f}%"
                   if dets else "no detections")
     dpg.set_value("pred_bar", min(1.0, _conf(dets[0])) if dets else 0.0)
-    dpg.set_value("pred_meta", f"{len(dets)} object(s)  |  {S['ms']} ms")
+    dpg.set_value("pred_list", "\n".join(f"{_label(d):<18}{_conf(d) * 100:5.1f}%"
+                                         for d in dets[:6]) + f"\n\n{S['ms']} ms")
     dpg.set_value("pred_raw", json.dumps(p)[:1500])
     dpg.set_value("api_status", "OK")
 
@@ -365,7 +383,8 @@ def main():
     tex = np.zeros(S["pw"] * S["ph"] * 3, dtype=np.float32)
 
     dpg.create_context()
-    dpg.create_viewport(title="Gibson Capture", width=1280, height=820, min_width=640, min_height=480)
+    dpg.create_viewport(title="Gibson Capture", width=1280, height=820,
+                        min_width=700, min_height=520)
     build_ui(tex)
     dpg.setup_dearpygui()
     dpg.show_viewport()
@@ -382,16 +401,16 @@ def main():
                 if f is not None:
                     S["frame"] = f
                     prev = cv2.resize(f, (S["pw"], S["ph"]))
-                    S["preview"] = prev
+                    S["preview"] = prev                     # BGR, what the Jetson wants
                     shown = cv2.LUT(prev, S["lut"])
                     draw_panel(shown)
-                    tex[:] = shown.ravel() * np.float32(1 / 255)
+                    tex[:] = shown[..., ::-1].ravel() * np.float32(1 / 255)   # BGR -> texture RGB
             else:
                 draw_panel(np.zeros((S["ph"], S["pw"], 3), np.uint8))
-            dpg.set_value("hud", f"ID {S['id']}   Image {S['img']}/3   "
+            dpg.set_value("hud", f"ID {S['id']}    {S['img']} of 3    "
                                  f"{LIGHTS[S['img']].replace('_', ' ')}"
                           if S["session"] else "No active session")
-            dpg.set_value("qstat", f"Pending writes: {SAVE_Q.qsize()}")
+            dpg.set_value("qstat", f"Queue: {SAVE_Q.qsize()}")
             dpg.render_dearpygui_frame()
     finally:
         S["run"] = False
@@ -427,6 +446,10 @@ def selftest():
     assert S["lut"][0] == 0 and S["lut"][255] == 255 and S["lut"][128] == 128  # 1.0 = passthrough
     set_gamma(g=2.2)
     assert S["lut"][128] < 128 and S["lut"][255] == 255                        # darkens midtones
+    # grab() returns BGR: a scene-red pixel must land in channel 2, and the texture
+    # upload must swap it back to channel 0 so faces are not blue.
+    red_bgr = np.array([[[0, 0, 255]]], np.uint8)
+    assert list(red_bgr[..., ::-1].ravel()) == [255, 0, 0]
     print("selftest ok")
 
 
