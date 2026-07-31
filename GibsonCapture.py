@@ -50,6 +50,44 @@ def _multipart(fields=(), files=()):
     return bytes(out), f"multipart/form-data; boundary={b}"
 
 
+# The Jetson is on a tailnet, i.e. a direct route. A machine with a corporate
+# proxy configured would otherwise send 100.x traffic to the proxy and hang.
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _base(u):
+    """Tolerate what people actually paste: no scheme, trailing slash, /ui, /v1."""
+    u = u.strip().rstrip("/")
+    if not u.startswith(("http://", "https://")):
+        u = "http://" + u
+    for tail in ("/ui", "/v1"):
+        if u.endswith(tail):
+            u = u[:-len(tail)]
+    return u
+
+
+def _hint(err):
+    """Turn a raw exception into the thing to go and check."""
+    e = err.lower()
+    if "timed out" in e or "timeout" in e:
+        # The gateway publishes 8000 on the host, so a capture PC on the same
+        # network as the Jetson reaches it directly. 100.x is the tailnet address
+        # and only resolves on a machine running Tailscale.
+        return ("NO ROUTE - on the same network as the Jetson? Use its LAN address "
+                "(http://192.168.x.x:8000). The 100.x address needs Tailscale running here.")
+    if "refused" in e:
+        return "REFUSED - address reached but nothing listening. Right port? Gateway running?"
+    if "unknown url type" in e or "no host" in e:
+        return "BAD URL - needs to look like http://100.103.105.68:8000"
+    if "name or service" in e or "getaddrinfo" in e:
+        return "CANNOT RESOLVE - use the 100.x address rather than a hostname."
+    if "401" in e:
+        return "KEY REJECTED - paste the whole key, it is case-sensitive."
+    if "403" in e:
+        return "WRONG SCOPE - this key is not allowed on that endpoint."
+    return err
+
+
 def _call(url, key, timeout, body=None, ctype=None):
     """Every endpoint wants X-API-Key; 401/403/422 come back as JSON detail."""
     headers = {"X-API-Key": key} if key else {}
@@ -57,7 +95,7 @@ def _call(url, key, timeout, body=None, ctype=None):
         headers["Content-Type"] = ctype
     req = urllib.request.Request(url, data=body, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with OPENER.open(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as ex:
         detail = ex.read().decode(errors="replace")[:300]
@@ -80,12 +118,12 @@ def predict(base, key, bgr, task="classification", model_version="", tta=False, 
     if model_version:
         fields.append(("model_version", model_version))
     body, ctype = _multipart(fields, [("images", "frame.jpg", jpg.tobytes())])
-    return _call(base.rstrip("/") + "/v1/predict", key, timeout, body, ctype)
+    return _call(_base(base) + "/v1/predict", key, timeout, body, ctype)
 
 
 def health(base, timeout=5.0):
     """GET /health - no key required, so it separates 'network down' from 'bad key'."""
-    return _call(base.rstrip("/") + "/health", "", timeout)
+    return _call(_base(base) + "/health", "", timeout)
 
 
 def _ranked(resp):
@@ -146,17 +184,24 @@ def detect_loop():
 
 
 def test_server():
-    h = health(dpg.get_value("url"))
+    url = _base(dpg.get_value("url"))
+    set_status(f"testing {url} ...")
+    h = health(url)
     if "error" in h:
-        set_status(f"unreachable - {h['error']}")
+        set_status(f"{_hint(h['error'])}\n[{url}/health]  {h['error']}")
         return
-    if S["preview"] is None:
-        set_status(f"reachable: {json.dumps(h)[:80]} (no frame yet to predict)")
+    if not dpg.get_value("key"):
+        set_status(f"server up ({json.dumps(h)[:60]}) - now paste an API key")
         return
-    r = send_once(S["preview"])
+    probe = S["preview"] if S["preview"] is not None else np.zeros((64, 64, 3), np.uint8)
+    r = predict(url, dpg.get_value("key"), probe, dpg.get_value("task"),
+                dpg.get_value("model_version"), False, dpg.get_value("timeout"))
+    if "error" in r:
+        set_status(f"server up, predict failed\n{_hint(r['error'])}\n{r['error']}")
+        return
     S["pred"] = r
-    set_status(f"HEALTH ok / PREDICT {r['error']}" if "error" in r else
-               f"HEALTH ok / PREDICT ok - {r.get('model_id')}:{r.get('model_version')}")
+    set_status(f"OK - {r.get('model_id')}:{r.get('model_version')} "
+               f"answered {r.get('label')} in {r.get('latency_ms', 0):.0f} ms")
 
 
 def set_status(msg):
@@ -216,9 +261,11 @@ def start_session():
 
 def capture():
     """Queue the frame and return immediately - the feed keeps running."""
-    if not S["session"] or S["frame"] is None:
-        log("Nothing to capture (start a session first)")
+    if S["frame"] is None:
+        log("No camera frame yet - nothing to capture")
         return
+    if not S["session"]:
+        start_session()      # first press just starts at the Start ID, no ceremony
     folder = os.path.join(SAVE_ROOT, dpg.get_value("vendor"), dpg.get_value("grade"), str(S["id"]))
     name = f"{time.strftime('%H-%M-%S')}_{S['img']}_{LIGHTS[S['img']]}.jpg"
     # 'Legacy colour' reproduces the original script's RGB2BGR swap before imwrite,
@@ -240,6 +287,16 @@ def capture():
 
 
 # ------------------------------------------------------------------ look
+def placeholder(msg, sub):
+    """So the video area never sits there as an unexplained black rectangle."""
+    img = np.full((S["ph"], S["pw"], 3), 28, np.uint8)
+    cv2.putText(img, msg, (30, S["ph"] // 2 - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                1.0, (210, 210, 210), 2)
+    cv2.putText(img, sub, (30, S["ph"] // 2 + 30), cv2.FONT_HERSHEY_SIMPLEX,
+                0.55, (150, 150, 150), 1)
+    return img
+
+
 def set_gamma(_=None, g=None):
     S["lut"] = (np.linspace(0, 1, 256) ** (GAMMA if g is None else g) * 255).astype(np.uint8)
 
@@ -355,7 +412,9 @@ def build_ui(tex):
                         with dpg.tab(label="Server"):
                             dpg.add_text("Jetson gateway")
                             dpg.add_input_text(tag="url", default_value=JETSON_URL, width=-1)
-                            dpg.add_input_text(label="API key", tag="key", password=True,
+                            dpg.add_text("Same network as the Jetson: use its LAN IP. "
+                                         "Off-site: the 100.x tailnet address.", wrap=300)
+                            dpg.add_input_text(label="API key", tag="key",
                                                default_value=API_KEY, width=150)
                             dpg.add_input_text(label="Task", tag="task",
                                                default_value="classification", width=150)
@@ -476,22 +535,28 @@ def main():
         threading.Thread(target=fn, daemon=True).start()
     log("Ready. Q = capture.")
 
+    idle = placeholder("NO CAMERA DETECTED",
+                       "Offline mode - the UI works, capture does not."
+                       if cam is None else "waiting for the first frame...")
     try:
         while dpg.is_dearpygui_running():
-            if cam is not None:
-                f = grab(cam)
-                if f is not None:
-                    S["frame"] = f
-                    prev = cv2.resize(f, (S["pw"], S["ph"]))
-                    S["preview"] = prev                     # BGR, what the server wants
-                    shown = cv2.LUT(prev, S["lut"])
-                    draw_panel(shown)
-                    tex[:] = shown[..., ::-1].ravel() * np.float32(1 / 255)   # BGR -> texture RGB
+            f = grab(cam) if cam is not None else None
+            if f is not None:
+                S["frame"] = f
+                prev = cv2.resize(f, (S["pw"], S["ph"]))
+                S["preview"] = prev                         # BGR, what the server wants
+                shown = cv2.LUT(prev, S["lut"])
+            elif S["frame"] is None:
+                shown = idle.copy()                         # never an unexplained black box
             else:
-                draw_panel(np.zeros((S["ph"], S["pw"], 3), np.uint8))
+                shown = None                                # dropped frame, keep the last one
+            if shown is not None:
+                draw_panel(shown)
+                tex[:] = shown[..., ::-1].ravel() * np.float32(1 / 255)   # BGR -> texture RGB
             dpg.set_value("hud", f"ID {S['id']}    {S['img']} of 3    "
                                  f"{LIGHTS[S['img']].replace('_', ' ')}"
-                          if S["session"] else "No active session")
+                          if S["session"] else
+                          f"Press Q to start at ID {dpg.get_value('start_id')}")
             dpg.set_value("qstat", f"Queue: {SAVE_Q.qsize()}")
             dpg.render_dearpygui_frame()
     finally:
@@ -523,6 +588,15 @@ def selftest():
     assert _ranked({"label": "x", "confidence": .5}) == [("x", .5)]
     assert _ranked({"detections": [{"class": "knot", "score": .8}]}) == [("knot", .8)]
     assert _ranked({"nope": 1}) == []
+    for raw, want in (("100.103.105.68:8000", "http://100.103.105.68:8000"),
+                      ("http://192.168.1.9:8000/", "http://192.168.1.9:8000"),
+                      (" http://jetson:8000/ui ", "http://jetson:8000"),
+                      ("http://jetson:8000/v1", "http://jetson:8000")):
+        assert _base(raw) == want, (raw, _base(raw))
+    assert "LAN address" in _hint("URLError: timed out")
+    assert "REFUSED" in _hint("ConnectionRefusedError: refused")
+    assert "KEY REJECTED" in _hint("HTTP 401: invalid API key")
+    assert _hint("boom") == "boom"
     assert _box({"x": 10, "y": 10, "width": 4, "height": 6}) == (8, 7, 12, 13)
     assert _box({"bbox": [1, 2, 3, 4]}) == (1, 2, 4, 6)
     assert _box({"x1": 1, "y1": 2, "x2": 3, "y2": 4}) == (1, 2, 3, 4)
