@@ -15,17 +15,14 @@ import dearpygui.dearpygui as dpg
 # ==========================================
 # CONFIGURATION (most of it editable in the GUI at runtime)
 # ==========================================
-SAVE_ROOT = r"C:\Gibson"
 JETSON_URL = "https://drstreet.taildab2f8.ts.net"  # Funnel: public, no client install
 API_KEY = os.environ.get("GIBSON_API_KEY", "")     # avoids retyping it every launch
-CAPTURE_ENABLED = False  # Live AI only for now; True brings shooting back
 ZOOM = 1.13              # calibration knob: lens/sensor crop, tune per rig
 GAMMA = 1.0              # calibration knob: display only, 1.0 = raw passthrough
 PREVIEW_W = 900          # texture width, keep small - these are old machines
 PANEL_W = 300            # at Normal text size; scales with the preset
 ROWS = 6                 # class-probability bars
 FONT = cv2.FONT_HERSHEY_SIMPLEX
-LIGHTS = {1: "Ring_and_Small_Lights", 2: "Only_Ring_Light", 3: "Only_Small_Lights"}
 
 # Every size is rasterised as its own font. set_global_font_scale() stretches one
 # bitmap instead, which is exactly what made the text look smeared before.
@@ -42,19 +39,19 @@ HEAD_C, DIM_C = (235, 235, 240), (145, 145, 152)
 # the API key is not in the repo. Plaintext: same trust level as the capture
 # folder itself - fine for a station PC, not for a shared login.
 CONF = os.path.join(os.path.expanduser("~"), ".gibson_capture.json")
-REMEMBER = ("url", "key", "vendor", "grade", "start_id", "total", "task",
-            "model_version", "tta", "interval", "timeout", "legacy_color", "boxes",
-            "font_family", "text_size", "gamma")
+REMEMBER = ("url", "key", "task", "model_version", "tta", "interval", "timeout",
+            "boxes", "font_family", "text_size", "gamma")
 
 S = {
-    "run": True, "frame": None, "preview": None,
-    "id": 0, "img": 1, "last_id": -1, "session": False, "saved": 0,
+    "run": True, "frame": None, "preview": None, "busy": False, "sent": 0,
     "detect": False, "pred": None, "drawn": None, "log": [], "dark": True,
     "lut": None, "pw": PREVIEW_W, "ph": 0, "panel": PANEL_W, "src_w": 1920,
     "aspect": 0.75, "tex": None, "tex_tag": "texA", "idle": None, "idle_sub": "",
-    "fonts": {}, "roles": {}, "bars": {}, "btn": {},
+    "fonts": {}, "roles": {}, "bars": {}, "btn": {}, "panel_wrap": [],
 }
-SAVE_Q = queue.Queue()   # capture never blocks the live feed
+# Captures are queued, never written to disk. The worker drains them one at a
+# time so a burst of presses cannot fan out into concurrent requests.
+PRED_Q = queue.Queue()
 
 
 # ------------------------------------------------------------------ Jetson API
@@ -213,10 +210,13 @@ def conf_color(c):
 
 
 def detect_loop():
-    """Live detection: latest preview -> POST /v1/predict -> result. Own thread."""
+    """Live detection: latest preview -> POST /v1/predict -> result. Own thread.
+
+    Stands down while a TTA capture is in flight so the two never contend for
+    the same model on the box."""
     while S["run"]:
         f = S["preview"]
-        if not S["detect"] or f is None:
+        if not S["detect"] or f is None or S["busy"] or not PRED_Q.empty():
             time.sleep(0.15)
             continue
         t = time.time()
@@ -255,22 +255,32 @@ def set_status(msg, color=DIM_C):
 
 
 # ------------------------------------------------------------------ capture queue
-def save_loop():
-    """Disk writes happen here so the live feed never stalls on a capture."""
+def send_loop():
+    """Drains queued captures into POST /v1/predict with test-time augmentation.
+
+    Nothing touches the disk: a capture is a queued frame and a server answer.
+    S["busy"] holds for the whole round trip so no other call - live detection
+    included - overlaps a TTA run, which is the slow, several-forward-passes one.
+    """
     while S["run"]:
         try:
-            path, bgr = SAVE_Q.get(timeout=0.3)
+            bgr = PRED_Q.get(timeout=0.3)
         except queue.Empty:
             continue
+        S["busy"] = True
         try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            cv2.imwrite(path, bgr)
-            S["saved"] += 1
-            log(f"saved {os.path.basename(path)}")
-        except Exception as ex:
-            log(f"SAVE FAILED: {ex}")
+            t = time.time()
+            r = predict(dpg.get_value("url"), dpg.get_value("key"), bgr,
+                        dpg.get_value("task"), dpg.get_value("model_version"),
+                        True, max(20.0, dpg.get_value("timeout")))   # TTA needs longer
+            S["pred"] = r
+            S["sent"] += 1
+            log(f"capture -> {r['error']}" if "error" in r else
+                f"capture -> {r.get('label')} "
+                f"{(r.get('confidence') or 0) * 100:.1f}%  ({time.time() - t:.1f}s, TTA)")
         finally:
-            SAVE_Q.task_done()
+            S["busy"] = False
+            PRED_Q.task_done()
 
 
 # ------------------------------------------------------------------ camera
@@ -316,27 +326,18 @@ def load_conf():
 
 
 def save_conf():
-    """Called on exit and after a connection test passes. Start ID is written as
-    wherever the session got to, so a relaunch carries on instead of repeating."""
+    """Called on exit and after a connection test passes."""
     try:
-        conf = {k: dpg.get_value(k) for k in REMEMBER}
-        if S["session"]:
-            conf["start_id"] = S["id"]
-            conf["total"] = max(1, S["last_id"] - S["id"] + 1)
         with open(CONF, "w") as f:
-            json.dump(conf, f, indent=1)
+            json.dump({k: dpg.get_value(k) for k in REMEMBER}, f, indent=1)
     except Exception as ex:
         print("could not save settings:", ex)
 
 
-def start_session():
-    S["id"] = dpg.get_value("start_id")
-    S["last_id"] = S["id"] + dpg.get_value("total") - 1
-    S["img"], S["session"] = 1, True
-    log(f"Session started: IDs {S['id']}-{S['last_id']}")
-
-
 def set_detect(_=None, on=False):
+    if on and (S["busy"] or not PRED_Q.empty()):
+        log("A TTA capture is still running - Live AI stays off until it finishes")
+        return
     S["detect"] = on
     dpg.configure_item("ai_btn", label="LIVE AI   ON" if on else "LIVE AI   OFF")
     dpg.bind_item_theme("ai_btn", S["btn"][GREEN] if on else 0)
@@ -345,33 +346,15 @@ def set_detect(_=None, on=False):
 
 
 def capture():
-    """Queue the frame and return immediately - the feed keeps running.
-
-    Switched off at the top: this build is Live AI only. Flip CAPTURE_ENABLED
-    back to True to restore shooting - the save queue below still works."""
-    if not CAPTURE_ENABLED:
-        log("Capture is disabled in this build")
-        return
+    """Queue this frame for a TTA prediction. Nothing is written to disk."""
     if S["frame"] is None:
         log("No camera frame yet - nothing to capture")
         return
-    if not S["session"]:
-        start_session()      # first press just starts at the Start ID, no ceremony
-    folder = os.path.join(SAVE_ROOT, dpg.get_value("vendor"), dpg.get_value("grade"), str(S["id"]))
-    name = f"{time.strftime('%H-%M-%S')}_{S['img']}_{LIGHTS[S['img']]}.jpg"
-    # 'Legacy colour' reproduces the original script's RGB2BGR swap before imwrite,
-    # which stores R and B swapped. Off = the file matches what you see on screen.
-    frame = S["frame"][..., ::-1] if dpg.get_value("legacy_color") else S["frame"]
-    SAVE_Q.put((os.path.join(folder, name), frame))
-    log(f"queued {S['id']}/{name}")
-
-    S["img"] += 1
-    if S["img"] > 3:
-        S["img"] = 1
-        S["id"] += 1
-        if S["id"] > S["last_id"]:
-            S["session"] = False
-            log("All requested IDs processed.")
+    if S["detect"]:
+        log("Turn Live AI off before sending a TTA capture")
+        return
+    PRED_Q.put(S["preview"] if S["preview"] is not None else S["frame"])
+    log(f"capture queued for TTA  (waiting: {PRED_Q.qsize()})")
 
 
 # ------------------------------------------------------------------ image
@@ -526,13 +509,26 @@ def ensure_tex(want_w):
 
 
 def fit_image(*_):
-    """Scale the preview to whatever room the window currently has."""
-    w = dpg.get_viewport_client_width() - S["panel"] - 70
+    """Fit the preview, then give the panel every pixel the video did not use.
+
+    On a wide-but-short screen the image is height-limited, and left-packing the
+    panel next to it stranded that spare width as dead space while the panel's
+    own text clipped. The panel absorbs it instead."""
+    avail = dpg.get_viewport_client_width() - 44   # window padding + item spacing
     h = dpg.get_viewport_client_height() - 130       # tab bar + last-event line
-    show_w = int(min(w, h / S["aspect"]))            # fit, preserving aspect
+    show_w = int(min(avail - PANEL_W, h / S["aspect"]))
+    panel = int(max(S["panel"], min(560, avail - show_w)))
+    # Height-limited video plus a capped panel can still leave slack. Split it
+    # around the video so the panel stays flush with the right edge.
+    slack = max(0, avail - show_w - panel)
+    dpg.configure_item("gap_l", width=slack // 2)
+    dpg.configure_item("gap_m", width=slack - slack // 2)
     ensure_tex(show_w)
     dpg.configure_item("img", width=max(160, show_w),
                        height=max(120, int(show_w * S["aspect"])))
+    dpg.configure_item("side", width=panel)
+    for item in S["panel_wrap"]:                     # text follows the new width
+        dpg.configure_item(item, wrap=panel - 40)
 
 
 # ------------------------------------------------------------------ ui
@@ -542,9 +538,12 @@ def section(text):
     dpg.add_separator()
 
 
-def note(text):
-    """Small dim explanatory line."""
-    return role(dpg.add_text(text, color=DIM_C, wrap=560), "small")
+def note(text, panel=False):
+    """Small dim explanatory line. `panel` ones re-wrap when the panel resizes."""
+    item = role(dpg.add_text(text, color=DIM_C, wrap=560), "small")
+    if panel:
+        S["panel_wrap"].append(item)
+    return item
 
 
 def btn_theme(rgb):
@@ -563,7 +562,7 @@ def build_ui(families):
                             tag=S["tex_tag"])
 
     S["bars"] = {c: bar_theme(c) for c in (GREEN, AMBER, RED, (95, 95, 100))}
-    S["btn"] = {c: btn_theme(c) for c in (GREEN, RED)}
+    S["btn"] = {c: btn_theme(c) for c in (GREEN, AMBER, RED)}
 
     with dpg.window(tag="root"):
         with dpg.tab_bar():
@@ -571,14 +570,17 @@ def build_ui(families):
             # ============================================== the working screen
             with dpg.tab(label="   Capture   "):
                 with dpg.group(horizontal=True):
+                    dpg.add_spacer(tag="gap_l", width=0)
                     dpg.add_image(S["tex_tag"], tag="img")
+                    dpg.add_spacer(tag="gap_m", width=0)
 
                     with dpg.child_window(width=S["panel"], autosize_y=True, tag="side"):
-                        dpg.add_button(label="LIVE AI   OFF", width=-1, height=52,
+                        dpg.add_button(label="CAPTURE  +  TTA      Q", callback=capture,
+                                       width=-1, height=58, tag="cap_btn")
+                        dpg.add_button(label="LIVE AI   OFF", width=-1, height=40,
                                        tag="ai_btn",
                                        callback=lambda: set_detect(on=not S["detect"]))
-                        dpg.add_button(label="CAPTURE  disabled", width=-1, height=38,
-                                       tag="cap_btn", callback=capture, enabled=False)
+                        role(dpg.add_text("", tag="qstat", color=DIM_C), "small")
                         dpg.add_spacer(height=6)
 
                         section("Picture")
@@ -586,21 +588,24 @@ def build_ui(families):
                                              default_value=GAMMA, min_value=0.4,
                                              max_value=3.0, width=-70,
                                              callback=lambda s, v: set_gamma(g=v))
-                        note("display only")
+                        note("display only", panel=True)
                         dpg.add_spacer(height=6)
 
                         section("Live AI")
                         dpg.add_slider_float(label="Every s", tag="interval",
                                              default_value=1.0, min_value=0.2,
                                              max_value=10.0, width=-70)
-                        role(dpg.add_text("-", tag="pred_label", wrap=260, color=DIM_C), "big")
+                        S["panel_wrap"].append(
+                            role(dpg.add_text("-", tag="pred_label", wrap=260,
+                                              color=DIM_C), "big"))
                         for i in range(ROWS):
                             dpg.add_progress_bar(tag=f"bar{i}", width=-1, overlay="", show=False)
-                        note("green above 75%, amber above 50%, red below")
+                        note("green above 75%, amber above 50%, red below", panel=True)
                         with dpg.tree_node(label="Raw response", tag="raw_node",
                                            show=False, default_open=True):
-                            role(dpg.add_text("", tag="pred_raw_live", wrap=250,
-                                              color=DIM_C), "small")
+                            S["panel_wrap"].append(
+                                role(dpg.add_text("", tag="pred_raw_live", wrap=250,
+                                                  color=DIM_C), "small"))
                 role(dpg.add_text("", tag="last", color=DIM_C), "small")
 
             # ============================================== everything else, two columns
@@ -609,36 +614,11 @@ def build_ui(families):
 
                     # ---------------------------------- left: this station
                     with dpg.child_window(width=520, autosize_y=True):
-                        section("Where the images go")
-                        with dpg.group(horizontal=True):
-                            dpg.add_input_text(label="Vendor", tag="vendor",
-                                               default_value="Electric_Hardwood", width=200)
-                            dpg.add_spacer(width=16)
-                            dpg.add_input_text(label="Grade", tag="grade",
-                                               default_value="2A", width=110)
-                        note(SAVE_ROOT + r"\<vendor>\<grade>\<id>" "\n"
-                             r"      \<time>_<shot>_<lighting>.jpg")
-                        dpg.add_spacer(height=12)
-
-                        section("Board IDs")
-                        with dpg.group(horizontal=True):
-                            dpg.add_input_int(label="Start ID", tag="start_id",
-                                              default_value=147, width=140)
-                            dpg.add_spacer(width=16)
-                            dpg.add_input_int(label="How many", tag="total",
-                                              default_value=5000, width=140)
-                        dpg.add_button(label="Restart session at Start ID",
-                                       callback=start_session, width=-1, height=34)
-                        note("Not needed to begin - the first capture starts the "
-                             "session. The saved Start ID is wherever you got to, so "
-                             "a relaunch resumes instead of repeating a board.")
-                        dpg.add_spacer(height=12)
-
-                        section("Saved files")
-                        dpg.add_checkbox(label="Legacy colour on save", tag="legacy_color",
-                                         default_value=True)
-                        note("On = byte-identical to the old script (R and B swapped "
-                             "in the file). Off = the file matches the screen.")
+                        section("Captures")
+                        note("Nothing is written to disk. A capture is queued in "
+                             "memory, sent to POST /v1/predict with test-time "
+                             "augmentation, and the answer replaces the panel. "
+                             "Live AI stands down until the queue drains.")
                         dpg.add_spacer(height=12)
 
                         section("Appearance")
@@ -810,9 +790,10 @@ def main():
     dpg.show_viewport()
     fit_image()
 
-    for fn in (detect_loop, save_loop):
+    for fn in (detect_loop, send_loop):
         threading.Thread(target=fn, daemon=True).start()
-    log("Ready. Press Q to capture.")
+    log("Ready. Q sends a capture to the server with TTA.")
+    last_q = None
 
     try:
         while dpg.is_dearpygui_running():
@@ -835,14 +816,21 @@ def main():
                 tex[:] = shown[..., ::-1].ravel() * np.float32(1 / 255)   # BGR -> texture RGB
 
             show_pred()
+            busy, n = S["busy"], PRED_Q.qsize()
+            if (busy, n) != last_q:                 # only touch widgets on a change
+                last_q = (busy, n)
+                dpg.configure_item("cap_btn", enabled=not (busy or S["detect"]),
+                                   label="SENDING  TTA ..." if busy else
+                                   "CAPTURE  +  TTA      Q")
+                dpg.bind_item_theme("cap_btn", S["btn"][AMBER] if busy else 0)
+                dpg.configure_item("ai_btn", enabled=not (busy or n))
+                dpg.set_value("qstat", f"{S['sent']} sent" + (f",  {n} waiting" if n else "")
+                              + ("  -  predicting" if busy else ""))
             dpg.render_dearpygui_frame()
     finally:
         S["run"] = False
         save_conf()                 # before the context goes, values live in it
         dpg.destroy_context()
-        if not SAVE_Q.empty():
-            print(f"Flushing {SAVE_Q.qsize()} queued image(s)...")
-            SAVE_Q.join()
         if cam is not None:
             for fn in (cam.EndAcquisition, cam.DeInit):
                 try:
