@@ -59,22 +59,32 @@ def _base(u):
     """Tolerate what people actually paste: no scheme, trailing slash, /ui, /v1."""
     u = u.strip().rstrip("/")
     if not u.startswith(("http://", "https://")):
-        u = "http://" + u
+        # tailscale serve terminates TLS on 443, so a bare MagicDNS name is https
+        u = ("https://" if u.endswith(".ts.net") else "http://") + u
     for tail in ("/ui", "/v1"):
         if u.endswith(tail):
             u = u[:-len(tail)]
     return u
 
 
-def _hint(err):
+def _tailnet(url):
+    """A 100.64.0.0/10 address or a MagicDNS name - both need Tailscale on THIS pc.
+    A .ts.net name resolves publicly but still points at the CGNAT address, so it
+    is not a way around installing Tailscale; only Funnel would be."""
+    return ".ts.net" in url or any(f"//100.{n}." in url for n in range(64, 128))
+
+
+def _hint(err, url=""):
     """Turn a raw exception into the thing to go and check."""
     e = err.lower()
     if "timed out" in e or "timeout" in e:
         # The gateway publishes 8000 on the host, so a capture PC on the same
-        # network as the Jetson reaches it directly. 100.x is the tailnet address
-        # and only resolves on a machine running Tailscale.
-        return ("NO ROUTE - on the same network as the Jetson? Use its LAN address "
-                "(http://192.168.x.x:8000). The 100.x address needs Tailscale running here.")
+        # network as the Jetson reaches it directly, no Tailscale involved.
+        return ("NO ROUTE to a tailnet address - Tailscale must be running on THIS pc "
+                "(tray icon: Connected). No Tailscale here? Use the Jetson's LAN IP "
+                "instead, http://192.168.x.x:8000" if _tailnet(url) else
+                "NO ROUTE - nothing answered. Check the address and that the PC can "
+                "reach that network.")
     if "refused" in e:
         return "REFUSED - address reached but nothing listening. Right port? Gateway running?"
     if "unknown url type" in e or "no host" in e:
@@ -94,18 +104,25 @@ def _call(url, key, timeout, body=None, ctype=None):
     if ctype:
         headers["Content-Type"] = ctype
     req = urllib.request.Request(url, data=body, headers=headers)
-    try:
-        with OPENER.open(req, timeout=timeout) as r:
-            return json.loads(r.read().decode())
-    except urllib.error.HTTPError as ex:
-        detail = ex.read().decode(errors="replace")[:300]
+    # Two attempts: over a relayed tailnet path the first TLS handshake regularly
+    # times out while the second, on a warm path, is fine. Retrying only on
+    # timeout keeps a real 401 or refusal instant.
+    for attempt in (1, 2):
         try:
-            detail = json.loads(detail).get("detail", detail)
-        except Exception:
-            pass
-        return {"error": f"HTTP {ex.code}: {detail}"}
-    except Exception as ex:
-        return {"error": f"{type(ex).__name__}: {ex}"}
+            with OPENER.open(req, timeout=timeout) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as ex:
+            detail = ex.read().decode(errors="replace")[:300]
+            try:
+                detail = json.loads(detail).get("detail", detail)
+            except Exception:
+                pass
+            return {"error": f"HTTP {ex.code}: {detail}"}
+        except Exception as ex:
+            err = {"error": f"{type(ex).__name__}: {ex}"}
+            if attempt == 2 or "timed out" not in str(ex).lower():
+                return err
+    return err
 
 
 def predict(base, key, bgr, task="classification", model_version="", tta=False, timeout=8.0):
@@ -121,7 +138,7 @@ def predict(base, key, bgr, task="classification", model_version="", tta=False, 
     return _call(_base(base) + "/v1/predict", key, timeout, body, ctype)
 
 
-def health(base, timeout=5.0):
+def health(base, timeout=10.0):
     """GET /health - no key required, so it separates 'network down' from 'bad key'."""
     return _call(_base(base) + "/health", "", timeout)
 
@@ -186,9 +203,9 @@ def detect_loop():
 def test_server():
     url = _base(dpg.get_value("url"))
     set_status(f"testing {url} ...")
-    h = health(url)
+    h = health(url, max(10.0, dpg.get_value("timeout")))
     if "error" in h:
-        set_status(f"{_hint(h['error'])}\n[{url}/health]  {h['error']}")
+        set_status(f"{_hint(h['error'], url)}\n[{url}/health]  {h['error']}")
         return
     if not dpg.get_value("key"):
         set_status(f"server up ({json.dumps(h)[:60]}) - now paste an API key")
@@ -197,7 +214,7 @@ def test_server():
     r = predict(url, dpg.get_value("key"), probe, dpg.get_value("task"),
                 dpg.get_value("model_version"), False, dpg.get_value("timeout"))
     if "error" in r:
-        set_status(f"server up, predict failed\n{_hint(r['error'])}\n{r['error']}")
+        set_status(f"server up, predict failed\n{_hint(r['error'], url)}\n{r['error']}")
         return
     S["pred"] = r
     set_status(f"OK - {r.get('model_id')}:{r.get('model_version')} "
@@ -591,9 +608,15 @@ def selftest():
     for raw, want in (("100.103.105.68:8000", "http://100.103.105.68:8000"),
                       ("http://192.168.1.9:8000/", "http://192.168.1.9:8000"),
                       (" http://jetson:8000/ui ", "http://jetson:8000"),
-                      ("http://jetson:8000/v1", "http://jetson:8000")):
+                      ("http://jetson:8000/v1", "http://jetson:8000"),
+                      ("drstreet.taildab2f8.ts.net", "https://drstreet.taildab2f8.ts.net")):
         assert _base(raw) == want, (raw, _base(raw))
-    assert "LAN address" in _hint("URLError: timed out")
+    assert _tailnet("https://drstreet.taildab2f8.ts.net")      # MagicDNS -> CGNAT
+    assert _tailnet("http://100.103.105.68:8000")
+    assert not _tailnet("http://192.168.1.9:8000")
+    assert not _tailnet("http://100.20.3.4:8000")              # public 100.x, not CGNAT
+    assert "Tailscale must be running" in _hint("timed out", "http://100.103.105.68:8000")
+    assert "Tailscale" not in _hint("timed out", "http://192.168.1.9:8000")
     assert "REFUSED" in _hint("ConnectionRefusedError: refused")
     assert "KEY REJECTED" in _hint("HTTP 401: invalid API key")
     assert _hint("boom") == "boom"
