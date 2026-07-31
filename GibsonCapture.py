@@ -18,6 +18,7 @@ import dearpygui.dearpygui as dpg
 SAVE_ROOT = r"C:\Gibson"
 JETSON_URL = "https://drstreet.taildab2f8.ts.net"  # Funnel: public, no client install
 API_KEY = os.environ.get("GIBSON_API_KEY", "")     # avoids retyping it every launch
+CAPTURE_ENABLED = False  # Live AI only for now; True brings shooting back
 ZOOM = 1.13              # calibration knob: lens/sensor crop, tune per rig
 GAMMA = 1.0              # calibration knob: display only, 1.0 = raw passthrough
 PREVIEW_W = 900          # texture width, keep small - these are old machines
@@ -336,22 +337,20 @@ def start_session():
 
 
 def set_detect(_=None, on=False):
-    """Live AI and capturing are separate modes: the operator is either grading
-    boards against the server or shooting a dataset, never both at once."""
     S["detect"] = on
-    dpg.configure_item("cap_btn", enabled=not on,
-                       label="CAPTURE      Q" if not on else "CAPTURE LOCKED")
-    dpg.bind_item_theme("cap_btn", S["btn"][RED] if on else 0)
     dpg.configure_item("ai_btn", label="LIVE AI   ON" if on else "LIVE AI   OFF")
     dpg.bind_item_theme("ai_btn", S["btn"][GREEN] if on else 0)
     dpg.configure_item("raw_node", show=on)   # the server's own words, while predicting
-    log("Live AI on - capture locked" if on else "Live AI off - capture ready")
+    log("Live AI on" if on else "Live AI off")
 
 
 def capture():
-    """Queue the frame and return immediately - the feed keeps running."""
-    if S["detect"]:                      # also covers the Q key, not just the button
-        log("Turn Live AI off to capture")
+    """Queue the frame and return immediately - the feed keeps running.
+
+    Switched off at the top: this build is Live AI only. Flip CAPTURE_ENABLED
+    back to True to restore shooting - the save queue below still works."""
+    if not CAPTURE_ENABLED:
+        log("Capture is disabled in this build")
         return
     if S["frame"] is None:
         log("No camera frame yet - nothing to capture")
@@ -378,28 +377,6 @@ def capture():
 # ------------------------------------------------------------------ image
 def set_gamma(_=None, g=None):
     S["lut"] = (np.linspace(0, 1, 256) ** (GAMMA if g is None else g) * 255).astype(np.uint8)
-
-
-def draw_hud(img):
-    """The operator's instruction goes ON the video, drawn by OpenCV: crisp at any
-    size and independent of the GUI font."""
-    scale = img.shape[1] / 900          # HUD keeps its proportions at any preview size
-    light = LIGHTS[S["img"]].replace("_", " ").upper()
-    if S["detect"]:
-        top, bottom = "LIVE AI RUNNING", "CAPTURE IS LOCKED  -  TURN LIVE AI OFF TO SHOOT"
-    elif S["session"]:
-        top = f"BOARD {S['id']}      SHOT {S['img']} OF 3"
-        bottom = f"SET LIGHTS TO {light},  THEN PRESS  Q"
-    else:
-        top = "READY"
-        bottom = (f"PRESS  Q  TO SHOOT BOARD {dpg.get_value('start_id')}  -  "
-                  f"SHOT 1 OF 3, LIGHTS {light}")
-    band = img[:int(86 * scale)]
-    band[:] = cv2.addWeighted(band, 0.25, np.zeros_like(band), 0, 0)   # legible on any board
-    cv2.putText(img, top, (int(18 * scale), int(36 * scale)), FONT, 1.0 * scale,
-                (255, 255, 255), max(1, int(2 * scale)), cv2.LINE_AA)
-    cv2.putText(img, bottom, (int(18 * scale), int(71 * scale)), FONT, 0.75 * scale,
-                (150, 235, 170), max(1, int(2 * scale)), cv2.LINE_AA)
 
 
 def draw_pred_overlay(img):
@@ -597,21 +574,11 @@ def build_ui(families):
                     dpg.add_image(S["tex_tag"], tag="img")
 
                     with dpg.child_window(width=S["panel"], autosize_y=True, tag="side"):
-                        dpg.add_button(label="CAPTURE      Q", callback=capture,
-                                       width=-1, height=66, tag="cap_btn")
-                        dpg.add_button(label="LIVE AI   OFF", width=-1, height=38,
+                        dpg.add_button(label="LIVE AI   OFF", width=-1, height=52,
                                        tag="ai_btn",
                                        callback=lambda: set_detect(on=not S["detect"]))
-                        with dpg.group(horizontal=True):
-                            role(dpg.add_text("0", tag="c_saved", color=GREEN), "head")
-                            note("saved")
-                            role(dpg.add_text("0", tag="c_queue", color=DIM_C), "head")
-                            note("queued")
-                        dpg.add_spacer(height=6)
-
-                        section("Do this now")
-                        role(dpg.add_text("", tag="now_light", wrap=260, color=GREEN), "head")
-                        role(dpg.add_text("", tag="now_step", wrap=260, color=DIM_C), "small")
+                        dpg.add_button(label="CAPTURE  disabled", width=-1, height=38,
+                                       tag="cap_btn", callback=capture, enabled=False)
                         dpg.add_spacer(height=6)
 
                         section("Picture")
@@ -619,12 +586,10 @@ def build_ui(families):
                                              default_value=GAMMA, min_value=0.4,
                                              max_value=3.0, width=-70,
                                              callback=lambda s, v: set_gamma(g=v))
-                        note("display only, saved files are untouched")
+                        note("display only")
                         dpg.add_spacer(height=6)
 
                         section("Live AI")
-                        dpg.add_checkbox(label="Predict continuously", tag="detect_cb",
-                                         callback=set_detect)
                         dpg.add_slider_float(label="Every s", tag="interval",
                                              default_value=1.0, min_value=0.2,
                                              max_value=10.0, width=-70)
@@ -679,7 +644,8 @@ def build_ui(families):
                         section("Appearance")
                         with dpg.group(horizontal=True):
                             dpg.add_combo(families, label="Font", tag="font_family",
-                                          default_value="Default",
+                                          default_value=("Consolas" if "Consolas" in families
+                                                         else "Default"),
                                           width=150, callback=apply_look)
                             dpg.add_spacer(width=16)
                             dpg.add_combo(list(TEXT_SIZES), label="Size", tag="text_size",
@@ -866,24 +832,9 @@ def main():
             if shown is not None:
                 draw_boxes(shown)
                 draw_pred_overlay(shown)
-                draw_hud(shown)
                 tex[:] = shown[..., ::-1].ravel() * np.float32(1 / 255)   # BGR -> texture RGB
 
             show_pred()
-            light = LIGHTS[S["img"]].replace("_", " ")
-            if S["detect"]:
-                dpg.set_value("now_light", "Live AI is running")
-                dpg.set_value("now_step", "capture is locked until you switch it off")
-            else:
-                dpg.set_value("now_light", f"Set lights to {light}")
-                dpg.set_value("now_step",
-                              f"then press Q for shot {S['img']} of 3, board {S['id']}"
-                              if S["session"] else
-                              f"then press Q to start board {dpg.get_value('start_id')}")
-            dpg.set_value("c_saved", str(S["saved"]))
-            n = SAVE_Q.qsize()
-            dpg.set_value("c_queue", str(n))
-            dpg.configure_item("c_queue", color=AMBER if n else DIM_C)
             dpg.render_dearpygui_frame()
     finally:
         S["run"] = False
